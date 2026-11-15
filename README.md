@@ -2,6 +2,8 @@
 
 고이탈률(High-Churn) 모바일 유휴 스토리지 환경을 위한 가상 스웜(Virtual Swarm) 기반 L1 블록체인 프로토콜 순수 Rust 구현체입니다.
 
+> 📖 **상세 구현 명세서**: [docs/implementation_spec.md](docs/implementation_spec.md)
+
 ---
 
 ## 1. 아키텍처 구성 (Crates & Binaries)
