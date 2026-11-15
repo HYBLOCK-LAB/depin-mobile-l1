@@ -1,5 +1,5 @@
 use l1_state_engine::executor::{expected_sample_index, heartbeat_signing_bytes};
-use l1_state_engine::state_db::{NativeTransaction, SWARM_SIZE};
+use l1_state_engine::state_db::{compute_member_verkle_root, NativeTransaction, SWARM_SIZE};
 use node_network::client::{
     build_cluster_map, download_payload, register_cluster_via_nodes, slots_for_node, upload_payload,
 };
@@ -243,6 +243,15 @@ fn distributed_bft_lazy_repair_crash_recovery_and_download_e2e() {
                 .expect("status after restart");
         assert_eq!(recovered_status.height, 12);
         assert_eq!(recovered_status.registered_nodes, SWARM_SIZE);
+        let expected_roster_pks: Vec<[u8; 33]> = cluster_map
+            .slots
+            .iter()
+            .map(|s| decode_fixed_hex::<33>(&s.pubkey_hex).expect("slot pubkey hex"))
+            .collect();
+        assert_eq!(
+            recovered_status.swarms[0].state.member_verkle_root,
+            compute_member_verkle_root(&kzg, &expected_roster_pks).expect("member verkle root")
+        );
         assert_eq!(
             hex::encode(recovered_status.swarms[0].state.active_blobs_root),
             report.new_blobs_root_hex

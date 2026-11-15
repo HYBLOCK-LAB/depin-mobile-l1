@@ -2,6 +2,7 @@ use crate::Result;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use verkle_fountain::verkle_kzg::{bytes_to_scalar, Kzg, KzgProof, KzgRoot, Scalar};
 
 mod bytes48 {
     use super::*;
@@ -192,19 +193,85 @@ impl LegacyStateDB {
     }
 }
 
-/// [제안 구조] 가상 스웜 단위로 48B Verkle Root만 L1 상태에 저장하는 네이티브 DB
+/// 멤버 공개키(P-256)를 BLS12-381 스칼라 필드 원소(F_p)로 결정론적 매핑한다.
+pub fn member_leaf_scalar(pubkey_p256: &[u8; 33]) -> Scalar {
+    let mut h = Sha256::new();
+    h.update(b"depin/member-leaf/v1");
+    h.update(pubkey_p256);
+    let digest = h.finalize();
+    let mut buf = [0u8; 32];
+    // 최상위 바이트(byte 31)를 0으로 유지해 248비트 정수로 만들어 항상 canonical < p를 보장한다.
+    buf[..31].copy_from_slice(&digest[..31]);
+    bytes_to_scalar(&buf).expect("valid scalar")
+}
+
+fn member_leaves(roster: &[[u8; 33]]) -> Result<Vec<Scalar>> {
+    if roster.len() != SWARM_SIZE {
+        return Err(crate::Error::InvalidInput);
+    }
+    Ok(roster.iter().map(member_leaf_scalar).collect())
+}
+
+/// 100대 스웜 로스터 공개키 벡터를 48B KZG/Verkle 멤버십 루트로 커밋한다.
+pub fn compute_member_verkle_root(kzg: &Kzg, roster: &[[u8; 33]]) -> Result<KzgRoot> {
+    let leaves = member_leaves(roster)?;
+    kzg.commit(&leaves).map_err(|_| crate::Error::BadProof)
+}
+
+/// 특정 슬롯의 멤버 공개키에 대한 48B KZG/Verkle 멤버십 오프닝 증명을 생성한다.
+pub fn open_member_verkle_proof(kzg: &Kzg, roster: &[[u8; 33]], slot: usize) -> Result<KzgProof> {
+    if slot >= SWARM_SIZE {
+        return Err(crate::Error::InvalidInput);
+    }
+    let leaves = member_leaves(roster)?;
+    kzg.open(&leaves, slot).map_err(|_| crate::Error::BadProof)
+}
+
+/// 멤버십 루트(`member_root`)에 대해 `slot` 위치의 공개키 멤버십 KZG 증명을 O(1) 페어링으로 검증한다.
+pub fn verify_member_verkle_proof(
+    kzg: &Kzg,
+    member_root: &KzgRoot,
+    slot: usize,
+    pubkey_p256: &[u8; 33],
+    proof: &KzgProof,
+) -> Result<()> {
+    if slot >= SWARM_SIZE {
+        return Err(crate::Error::BadProof);
+    }
+    kzg.verify(member_root, slot, member_leaf_scalar(pubkey_p256), proof)
+        .map_err(|_| crate::Error::BadProof)
+}
+
+/// [제안 구조] 가상 스웜 단위로 148B 고정 헤더(48B Member Verkle Root 포함)만 L1 합의 상태에 커밋하는 네이티브 DB
+///
+/// # 상태 경계 분리 (On-chain Consensus State vs Off-chain Auxiliary Index)
+/// - **On-chain consensus state (`swarms`)**: 스웜당 148B 고정 크기 `VirtualSwarmState` 맵.
+///   스웜 초기화 이후 `compute_state_root`는 오직 이 영역만 해시해 BFT 합의 상태 크기를 148B/스웜으로 압축한다.
+/// - **Off-chain auxiliary index (`swarm_rosters`, `nodes`, `standby_pool`)**:
+///   실행기/검증자/노드가 로스터 조회, 대기열 충원, 로컬 지분·보상 추적을 위해 유지하는 오프체인 보조 인덱스다.
+///   온체인 스웜 상태 루트에는 직접 포함되지 않으며, 멤버십 무결성은 `VirtualSwarmState::member_verkle_root`에 대한
+///   KZG/Verkle 증명으로 검증한다.
 #[derive(Default, Clone, Debug)]
 pub struct EnshrinedSwarmDB {
+    /// [On-chain Consensus State] 스웜 ID -> 148B 고정 헤더 (BFT state_root 커밋 대상)
     pub swarms: BTreeMap<u64, VirtualSwarmState>,
+    /// [Off-chain Auxiliary Index] 스웜 ID -> 슬롯별 공개키 로스터 캐시 (KZG 멤버십 증명 생성·조회용)
     pub swarm_rosters: BTreeMap<u64, Vec<[u8; 33]>>,
+    /// [Off-chain Auxiliary Index] 노드 공개키 -> 계정·스테이킹·보상·슬래싱 로컬 인덱스
     pub nodes: BTreeMap<[u8; 33], NodeAccount>,
+    /// [Off-chain Auxiliary Index] 충원 대기 중인 예비 모바일 노드 공개키 풀
     pub standby_pool: Vec<[u8; 33]>,
 }
 
 impl EnshrinedSwarmDB {
+    /// L1 BFT 합의 상태 루트에 커밋되는 온체인 스웜 헤더 총 크기 (Bytes)
+    pub fn onchain_consensus_bytes(&self) -> usize {
+        self.swarms.len() * VirtualSwarmState::encoded_bytes_len()
+    }
+
     /// 스웜 온체인 상태 메타데이터 총 크기 (Bytes)
     pub fn swarm_headers_bytes(&self) -> usize {
-        self.swarms.len() * VirtualSwarmState::encoded_bytes_len()
+        self.onchain_consensus_bytes()
     }
 
     pub fn get_swarm(&self, swarm_id: u64) -> Result<&VirtualSwarmState> {
@@ -257,10 +324,95 @@ mod tests {
             },
         );
         assert_eq!(enshrined.swarm_headers_bytes(), 148);
+        assert_eq!(enshrined.onchain_consensus_bytes(), 148);
+        // 오프체인 보조 인덱스(rosters/nodes/standby)를 채워도 온체인 합의 크기는 148B로 유지된다.
+        enshrined.swarm_rosters.insert(7, owners.clone());
+        for pk in &owners {
+            enshrined.nodes.insert(
+                *pk,
+                NodeAccount {
+                    pubkey_p256: *pk,
+                    ip_subnet_hash: 1,
+                    country_code: 82,
+                    stake: 2_000,
+                    reward_balance: 0,
+                    consecutive_offline_epochs: 0,
+                    slashed: false,
+                },
+            );
+        }
+        enshrined.standby_pool.push([0xBBu8; 33]);
+        assert_eq!(enshrined.onchain_consensus_bytes(), 148);
         assert!(enshrined.get_swarm(7).is_ok());
         assert!(matches!(
             enshrined.get_swarm(999),
             Err(crate::Error::InvalidInput)
+        ));
+    }
+
+    #[test]
+    fn member_verkle_root_commit_open_verify_and_rejects_tampering() {
+        use rand::{rngs::StdRng, SeedableRng};
+
+        let mut rng = StdRng::seed_from_u64(303);
+        let kzg = Kzg::setup(SWARM_SIZE - 1, &mut rng);
+
+        let roster: Vec<[u8; 33]> = (0..SWARM_SIZE)
+            .map(|i| {
+                let mut pk = [0u8; 33];
+                pk[0] = 0x02;
+                pk[1] = i as u8;
+                pk[32] = (i.wrapping_mul(17)) as u8;
+                pk
+            })
+            .collect();
+
+        // 결정론성 & 서로 다른 공개키 구분 확인
+        assert_eq!(member_leaf_scalar(&roster[0]), member_leaf_scalar(&roster[0]));
+        assert_ne!(member_leaf_scalar(&roster[0]), member_leaf_scalar(&roster[1]));
+
+        // 로스터 길이 불일치 및 슬롯 범위 초과 거부
+        assert!(matches!(
+            compute_member_verkle_root(&kzg, &roster[..99]),
+            Err(crate::Error::InvalidInput)
+        ));
+        assert!(matches!(
+            open_member_verkle_proof(&kzg, &roster[..99], 0),
+            Err(crate::Error::InvalidInput)
+        ));
+        assert!(matches!(
+            open_member_verkle_proof(&kzg, &roster, SWARM_SIZE),
+            Err(crate::Error::InvalidInput)
+        ));
+
+        let member_root = compute_member_verkle_root(&kzg, &roster).unwrap();
+        for slot in [0, 42, 99] {
+            let proof = open_member_verkle_proof(&kzg, &roster, slot).unwrap();
+            verify_member_verkle_proof(&kzg, &member_root, slot, &roster[slot], &proof).unwrap();
+
+            // 다른 공개키, 다른 슬롯, 변조된 루트, 범위 초과 슬롯 모두 거부
+            let other_slot = (slot + 1) % SWARM_SIZE;
+            assert!(matches!(
+                verify_member_verkle_proof(&kzg, &member_root, slot, &roster[other_slot], &proof),
+                Err(crate::Error::BadProof)
+            ));
+            assert!(matches!(
+                verify_member_verkle_proof(&kzg, &member_root, other_slot, &roster[slot], &proof),
+                Err(crate::Error::BadProof)
+            ));
+
+            let mut tampered_root = member_root;
+            tampered_root[0] ^= 0x01;
+            assert!(matches!(
+                verify_member_verkle_proof(&kzg, &tampered_root, slot, &roster[slot], &proof),
+                Err(crate::Error::BadProof)
+            ));
+        }
+
+        let proof0 = open_member_verkle_proof(&kzg, &roster, 0).unwrap();
+        assert!(matches!(
+            verify_member_verkle_proof(&kzg, &member_root, SWARM_SIZE, &roster[0], &proof0),
+            Err(crate::Error::BadProof)
         ));
     }
 

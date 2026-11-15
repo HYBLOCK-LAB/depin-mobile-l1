@@ -1,4 +1,5 @@
 use crate::state_db::{
+    compute_member_verkle_root, open_member_verkle_proof, verify_member_verkle_proof,
     EnshrinedSwarmDB, NativeTransaction, NodeAccount, VirtualSwarmState, SWARM_SIZE,
 };
 use crate::{Error, Result};
@@ -42,6 +43,7 @@ pub struct SettledCheckpointRecord {
     pub aggregator_slot: u8,
     pub aggregator_pubkey: [u8; 33],
     pub uptime_bitmap: u128,
+    pub member_verkle_root: KzgRoot,
     pub roster_snapshot: Vec<[u8; 33]>,
     pub fault_penalized_slots: BTreeSet<u8>,
 }
@@ -326,8 +328,22 @@ impl Executor {
                     }
                 }
 
-                // 1. 제출한 어그리게이터(0번 또는 차순위 승계자)의 TEE P-256 서명 검증
+                // 0. member_verkle_root 일치 및 어그리게이터 슬롯 멤버십 KZG 증명 검증
+                let expected_member_root = compute_member_verkle_root(kzg, &roster)?;
+                if expected_member_root != swarm.member_verkle_root {
+                    return Err(Error::BadProof);
+                }
                 let agg_pubkey = roster[agg_idx];
+                let agg_member_proof = open_member_verkle_proof(kzg, &roster, agg_idx)?;
+                verify_member_verkle_proof(
+                    kzg,
+                    &swarm.member_verkle_root,
+                    agg_idx,
+                    &agg_pubkey,
+                    &agg_member_proof,
+                )?;
+
+                // 1. 제출한 어그리게이터(0번 또는 차순위 승계자)의 TEE P-256 서명 검증
                 let agg_vk =
                     VerifyingKey::from_sec1_bytes(&agg_pubkey).map_err(|_| Error::BadSignature)?;
                 let sig =
@@ -483,6 +499,7 @@ impl Executor {
                 // 100대 비트맵 순회 정산 & 유예 기간 초과 노드 지연 슬래싱 + 대기 노드 교체
                 let mut total_slashed = 0u128;
                 let mut new_total_bond = staged_swarm.total_bond_balance;
+                let mut roster_changed = false;
                 for (slot_idx, slot_pk) in staged_roster.iter_mut().enumerate() {
                     let is_online = (uptime_bitmap & (1u128 << slot_idx)) != 0;
                     if is_online {
@@ -506,6 +523,7 @@ impl Executor {
                                 new_total_bond =
                                     new_total_bond.saturating_sub(old_remaining_stake);
                                 *slot_pk = replacement_pk;
+                                roster_changed = true;
                                 if let Some(rep_acc) = staged_db.nodes.get(&replacement_pk) {
                                     new_total_bond += rep_acc.stake;
                                 }
@@ -514,6 +532,10 @@ impl Executor {
                     }
                 }
 
+                if roster_changed {
+                    staged_swarm.member_verkle_root =
+                        compute_member_verkle_root(kzg, staged_roster)?;
+                }
                 staged_swarm.total_bond_balance = new_total_bond;
                 staged_swarm.active_blobs_root = new_blobs_root;
                 staged_swarm.last_epoch_settled = epoch;
@@ -527,6 +549,7 @@ impl Executor {
                         aggregator_slot,
                         aggregator_pubkey: agg_pubkey,
                         uptime_bitmap,
+                        member_verkle_root: swarm.member_verkle_root,
                         roster_snapshot: roster,
                         fault_penalized_slots: BTreeSet::new(),
                     },
@@ -570,17 +593,40 @@ impl Executor {
                     return Err(Error::InvalidFaultProof);
                 }
 
+                // 피해 노드와 반장 슬롯이 해당 에포크 member_verkle_root에 속함을 KZG 멤버십 증명으로 검증
+                let victim_pk = *rec
+                    .roster_snapshot
+                    .get(node_slot as usize)
+                    .ok_or(Error::InvalidInput)?;
+                let agg_pk = rec.aggregator_pubkey;
+                let victim_proof =
+                    open_member_verkle_proof(kzg, &rec.roster_snapshot, node_slot as usize)?;
+                verify_member_verkle_proof(
+                    kzg,
+                    &rec.member_verkle_root,
+                    node_slot as usize,
+                    &victim_pk,
+                    &victim_proof,
+                )?;
+                let agg_proof =
+                    open_member_verkle_proof(kzg, &rec.roster_snapshot, aggregator_slot as usize)?;
+                verify_member_verkle_proof(
+                    kzg,
+                    &rec.member_verkle_root,
+                    aggregator_slot as usize,
+                    &agg_pk,
+                    &agg_proof,
+                )?;
+
                 // 반장의 개인키로 서명된 Heartbeat 생존 확인 영수증 검증
-                let agg_vk = VerifyingKey::from_sec1_bytes(&rec.aggregator_pubkey)
-                    .map_err(|_| Error::BadSignature)?;
+                let agg_vk =
+                    VerifyingKey::from_sec1_bytes(&agg_pk).map_err(|_| Error::BadSignature)?;
                 let sig =
                     Signature::from_slice(&signed_pong_receipt).map_err(|_| Error::BadSignature)?;
                 let msg = heartbeat_signing_bytes(swarm_id, epoch, node_slot);
                 agg_vk.verify(&msg, &sig).map_err(|_| Error::BadSignature)?;
 
                 // 조작 입증 완료 -> 반장 담보금 슬래싱 후 피해 노드에 보상 지급
-                let victim_pk = rec.roster_snapshot[node_slot as usize];
-                let agg_pk = rec.aggregator_pubkey;
                 rec.fault_penalized_slots.insert(node_slot);
 
                 let slashed = if let Some(agg_acc) = self.db.nodes.get_mut(&agg_pk) {
@@ -663,7 +709,8 @@ mod tests {
             .map(|i| Scalar::from((i * i * 7 + 13) as u64))
             .collect();
         let root = kzg.commit(&fps).unwrap();
-        exec.init_swarm(0, roster.clone(), [0x11; 48], root, 10_000)
+        let member_root = compute_member_verkle_root(&kzg, &roster).unwrap();
+        exec.init_swarm(0, roster.clone(), member_root, root, 10_000)
             .unwrap();
 
         (exec, kzg, keys, roster, fps, root, epoch_seed)
@@ -1203,5 +1250,172 @@ mod tests {
             ),
             Err(Error::BadProof)
         ));
+    }
+
+    #[test]
+    fn checkpoint_rejects_tampered_member_verkle_root_and_out_of_sync_roster() {
+        let (mut exec, kzg, keys, _roster, fps, root, epoch_seed) = setup_swarm_executor();
+        let full_bitmap = (1u128 << SWARM_SIZE) - 1;
+
+        // (a) 온체인 member_verkle_root 변조 시 체크포인트 거부
+        let mut tampered_exec = exec.clone();
+        tampered_exec.db.swarms.get_mut(&0).unwrap().member_verkle_root[0] ^= 0xFF;
+        let ckpt_tampered =
+            build_signed_checkpoint(0, 1, 0, &keys[0], &kzg, &fps, root, full_bitmap, &epoch_seed);
+        assert!(matches!(
+            tampered_exec.execute(ckpt_tampered, &kzg, &epoch_seed),
+            Err(Error::BadProof)
+        ));
+
+        // (b) 오프체인 로스터가 다른 공개키로 변조되어 member_verkle_root와 불일치 시 거부
+        let alt_sk = key_for(999);
+        let alt_pk: [u8; 33] = alt_sk
+            .verifying_key()
+            .to_encoded_point(true)
+            .as_bytes()
+            .try_into()
+            .unwrap();
+        exec.db.swarm_rosters.get_mut(&0).unwrap()[0] = alt_pk;
+        let ckpt_bad_roster =
+            build_signed_checkpoint(0, 1, 0, &alt_sk, &kzg, &fps, root, full_bitmap, &epoch_seed);
+        assert!(matches!(
+            exec.execute(ckpt_bad_roster, &kzg, &epoch_seed),
+            Err(Error::BadProof)
+        ));
+    }
+
+    #[test]
+    fn delayed_slashing_replaces_slot_and_updates_member_verkle_root() {
+        let (mut exec, kzg, keys, roster, fps, root, epoch_seed) = setup_swarm_executor();
+        let initial_member_root = exec.db.get_swarm(0).unwrap().member_verkle_root;
+
+        // 기존 스웜 배정 완료 노드는 대기 풀에서 비운 뒤 신규 예비 노드 1대 등록
+        exec.db.standby_pool.clear();
+        let standby_sk = key_for(777);
+        let (standby_pk, standby_sig) =
+            sign_registration(&standby_sk, exec.config.chain_id, 250, 82, 3_000);
+        exec.execute(
+            NativeTransaction::RegisterMobileNode {
+                pubkey_p256: standby_pk,
+                hw_attestation_sig: standby_sig,
+                ip_subnet_hash: 250,
+                country_code: 82,
+                stake: 3_000,
+            },
+            &kzg,
+            &epoch_seed,
+        )
+        .unwrap();
+        assert_eq!(exec.db.standby_pool, vec![standby_pk]);
+
+        let full_bitmap = (1u128 << SWARM_SIZE) - 1;
+        let bitmap_without_15 = full_bitmap & !(1u128 << 15);
+        let evicted_pk = roster[15];
+
+        // 1~3 에포크까지는 유예 기간 -> 슬래싱/교체 없음, member_verkle_root 유지
+        for epoch in 1..=3 {
+            let tx = build_signed_checkpoint(
+                0,
+                epoch,
+                0,
+                &keys[0],
+                &kzg,
+                &fps,
+                root,
+                bitmap_without_15,
+                &epoch_seed,
+            );
+            let receipt = exec.execute(tx, &kzg, &epoch_seed).unwrap();
+            assert_eq!(receipt.slashed_amount, 0);
+            assert_eq!(exec.db.get_swarm(0).unwrap().member_verkle_root, initial_member_root);
+        }
+
+        // 4번째 에포크 도달 -> 지연 슬래싱 + 대기 노드 충원 + member_verkle_root 자동 재계산
+        let tx4 = build_signed_checkpoint(
+            0,
+            4,
+            0,
+            &keys[0],
+            &kzg,
+            &fps,
+            root,
+            bitmap_without_15,
+            &epoch_seed,
+        );
+        let receipt4 = exec.execute(tx4, &kzg, &epoch_seed).unwrap();
+        assert_eq!(receipt4.slashed_amount, exec.config.offline_slash_penalty);
+        assert!(exec.db.standby_pool.is_empty());
+        assert_eq!(exec.db.swarm_rosters[&0][15], standby_pk);
+
+        let updated_member_root = exec.db.get_swarm(0).unwrap().member_verkle_root;
+        assert_ne!(updated_member_root, initial_member_root);
+        assert_eq!(
+            updated_member_root,
+            compute_member_verkle_root(&kzg, &exec.db.swarm_rosters[&0]).unwrap()
+        );
+
+        // 갱신된 member_verkle_root로 새 노드 멤버십 증명 통과, 퇴출 노드 거부
+        let new_proof = open_member_verkle_proof(&kzg, &exec.db.swarm_rosters[&0], 15).unwrap();
+        verify_member_verkle_proof(&kzg, &updated_member_root, 15, &standby_pk, &new_proof)
+            .unwrap();
+        assert!(matches!(
+            verify_member_verkle_proof(&kzg, &updated_member_root, 15, &evicted_pk, &new_proof),
+            Err(Error::BadProof)
+        ));
+
+        // 교체 이후 에포크(5) 체크포인트도 새 member_verkle_root 기준으로 정상 정산
+        let tx5 = build_signed_checkpoint(
+            0,
+            5,
+            0,
+            &keys[0],
+            &kzg,
+            &fps,
+            root,
+            full_bitmap,
+            &epoch_seed,
+        );
+        exec.execute(tx5, &kzg, &epoch_seed).unwrap();
+
+        // 에포크 4(교체 직전 로스터/루트 스냅샷)에 대한 Heartbeat Fault Proof도
+        // SettledCheckpointRecord.member_verkle_root 기준으로 검증 가능하며,
+        // 기록 내 member_verkle_root 변조 시 BadProof로 거부된다.
+        let msg = heartbeat_signing_bytes(0, 4, 15);
+        let sig: Signature = keys[0].sign(&msg);
+        let mut tampered_rec_exec = exec.clone();
+        tampered_rec_exec
+            .settled_history
+            .get_mut(&(0, 4))
+            .unwrap()
+            .member_verkle_root[0] ^= 0x55;
+        assert!(matches!(
+            tampered_rec_exec.execute(
+                NativeTransaction::SubmitHeartbeatFaultProof {
+                    swarm_id: 0,
+                    epoch: 4,
+                    node_slot: 15,
+                    aggregator_slot: 0,
+                    signed_pong_receipt: sig.to_bytes().into(),
+                },
+                &kzg,
+                &epoch_seed,
+            ),
+            Err(Error::BadProof)
+        ));
+
+        let fault_receipt = exec
+            .execute(
+                NativeTransaction::SubmitHeartbeatFaultProof {
+                    swarm_id: 0,
+                    epoch: 4,
+                    node_slot: 15,
+                    aggregator_slot: 0,
+                    signed_pong_receipt: sig.to_bytes().into(),
+                },
+                &kzg,
+                &epoch_seed,
+            )
+            .unwrap();
+        assert_eq!(fault_receipt.slashed_amount, exec.config.aggregator_fault_slash);
     }
 }

@@ -1,7 +1,9 @@
 use l1_state_engine::consensus::{BftEngine, ValidatorInfo, ValidatorSigner};
 use l1_state_engine::executor::{sign_registration, Executor, ExecutorConfig};
 use l1_state_engine::shuffler::{route_file_to_swarm, shuffle, NodeDescriptor, ShuffleConfig};
-use l1_state_engine::state_db::{LegacyStateDB, NativeTransaction, VirtualSwarmState, SWARM_SIZE};
+use l1_state_engine::state_db::{
+    compute_member_verkle_root, LegacyStateDB, NativeTransaction, VirtualSwarmState, SWARM_SIZE,
+};
 use p256::ecdsa::SigningKey;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
@@ -145,7 +147,8 @@ fn main() {
     let mut legacy_db = LegacyStateDB::default();
     legacy_db.insert_blob_slots(0, &swarm_roster);
 
-    exec.init_swarm(0, swarm_roster.clone(), [0x11; 48], root, 10_000)
+    let member_root = compute_member_verkle_root(&kzg, &swarm_roster).expect("member verkle root");
+    exec.init_swarm(0, swarm_roster.clone(), member_root, root, 10_000)
         .expect("init swarm");
     let mut fsm = LazyRepairFsm::new(shards, 45, 60).expect("fsm");
 

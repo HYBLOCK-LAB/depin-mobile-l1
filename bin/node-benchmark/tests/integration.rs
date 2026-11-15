@@ -3,7 +3,9 @@ use l1_state_engine::executor::{
     expected_unchanged_slot_index, sign_registration, Executor, ExecutorConfig,
 };
 use l1_state_engine::shuffler::{route_file_to_swarm, shuffle, NodeDescriptor, ShuffleConfig};
-use l1_state_engine::state_db::{NativeTransaction, RepairEntry, SWARM_SIZE};
+use l1_state_engine::state_db::{
+    compute_member_verkle_root, NativeTransaction, RepairEntry, SWARM_SIZE,
+};
 use l1_state_engine::Error as L1Error;
 use p256::ecdsa::SigningKey;
 use rand::SeedableRng;
@@ -108,7 +110,8 @@ fn e2e_lifecycle_safe_buffer_repair_successor_bft_settlement_and_decode() {
         .collect();
 
     let _routed_swarm = route_file_to_swarm(&shards[0].object_id, &epoch_seed, 1).unwrap();
-    exec.init_swarm(0, roster.clone(), [0x22; 48], init_root, 5_000)
+    let member_root = compute_member_verkle_root(&kzg, &roster).unwrap();
+    exec.init_swarm(0, roster.clone(), member_root, init_root, 5_000)
         .unwrap();
 
     let mut fsm = LazyRepairFsm::new(shards, 45, 60).unwrap();
@@ -218,7 +221,8 @@ fn rejects_fraudulent_root_swap_and_slashes_dishonest_aggregator_heartbeat() {
         .map(|i| kzg.open(&fps, i).unwrap())
         .collect();
 
-    exec.init_swarm(0, roster.clone(), [0x33; 48], root, 10_000)
+    let member_root = compute_member_verkle_root(&kzg, &roster).unwrap();
+    exec.init_swarm(0, roster.clone(), member_root, root, 10_000)
         .unwrap();
     let fsm = LazyRepairFsm::new(shards, 45, 60).unwrap();
 
@@ -314,7 +318,8 @@ fn delayed_slashing_triggers_after_grace_period_and_replaces_from_standby() {
         .map(|i| kzg.open(&fps, i).unwrap())
         .collect();
 
-    exec.init_swarm(0, roster.clone(), [0x44; 48], root, 20_000)
+    let initial_member_root = compute_member_verkle_root(&kzg, &roster).unwrap();
+    exec.init_swarm(0, roster.clone(), initial_member_root, root, 20_000)
         .unwrap();
     let fsm = LazyRepairFsm::new(shards, 45, 60).unwrap();
 
@@ -370,6 +375,12 @@ fn delayed_slashing_triggers_after_grace_period_and_replaces_from_standby() {
     assert!(exec.db.nodes[&dead_slot_pk].slashed);
     assert_eq!(exec.db.standby_pool.len(), initial_standby_len - 1);
     assert_ne!(exec.db.swarm_rosters[&0][15], dead_slot_pk);
+    let updated_member_root = exec.db.get_swarm(0).unwrap().member_verkle_root;
+    assert_ne!(updated_member_root, initial_member_root);
+    assert_eq!(
+        updated_member_root,
+        compute_member_verkle_root(&kzg, &exec.db.swarm_rosters[&0]).unwrap()
+    );
 }
 
 #[test]
@@ -385,7 +396,8 @@ fn rejects_out_of_order_aggregator_and_tampered_unchanged_slot_on_repair() {
         .map(|i| kzg.open(&init_fps, i).unwrap())
         .collect();
 
-    exec.init_swarm(0, roster.clone(), [0x55; 48], init_root, 10_000)
+    let member_root = compute_member_verkle_root(&kzg, &roster).unwrap();
+    exec.init_swarm(0, roster.clone(), member_root, init_root, 10_000)
         .unwrap();
 
     // 1. 0번 슬롯이 온라인인데 2번 슬롯이 반장 권한으로 제출 시도 -> Unauthorized
