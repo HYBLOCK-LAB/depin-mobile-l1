@@ -222,6 +222,13 @@ struct StoredShardEnvelope {
 pub struct NodeStorage;
 
 impl NodeStorage {
+    fn validate_hex_id(id: &str) -> Result<()> {
+        if id.is_empty() || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(Error::Network("invalid object_id_hex".into()));
+        }
+        Ok(())
+    }
+
     fn slots_dir(data_dir: &Path) -> PathBuf {
         data_dir.join("slots")
     }
@@ -234,9 +241,23 @@ impl NodeStorage {
         Self::heartbeats_dir(data_dir).join(format!("epoch_{epoch}_slot_{target_slot}.json"))
     }
 
-    fn meta_path(data_dir: &Path, slot: u8, is_custodian: bool) -> PathBuf {
+    fn manifests_dir(data_dir: &Path) -> PathBuf {
+        data_dir.join("manifests")
+    }
+
+    fn manifest_path(data_dir: &Path, object_id_hex: &str) -> Result<PathBuf> {
+        Self::validate_hex_id(object_id_hex)?;
+        Ok(Self::manifests_dir(data_dir).join(format!("manifest_{object_id_hex}.json")))
+    }
+
+    fn meta_path(
+        data_dir: &Path,
+        slot: u8,
+        is_custodian: bool,
+        object_id_hex: &str,
+    ) -> PathBuf {
         let prefix = if is_custodian { "custodian_" } else { "" };
-        Self::slots_dir(data_dir).join(format!("{prefix}slot_{slot}_meta.json"))
+        Self::slots_dir(data_dir).join(format!("{prefix}slot_{slot}_{object_id_hex}_meta.json"))
     }
 
     fn shard_path(data_dir: &Path, slot: u8, is_custodian: bool, object_id_hex: &str) -> PathBuf {
@@ -252,7 +273,8 @@ impl NodeStorage {
         shard: &ShardDto,
         proof_hex: &str,
     ) -> Result<bool> {
-        let meta_path = Self::meta_path(data_dir, slot, is_custodian);
+        Self::validate_hex_id(&shard.object_id_hex)?;
+        let meta_path = Self::meta_path(data_dir, slot, is_custodian, &shard.object_id_hex);
         if !is_custodian && meta_path.exists() {
             let existing: SlotMeta = serde_json::from_slice(&fs::read(&meta_path)?)?;
             if generation < existing.generation {
@@ -297,6 +319,7 @@ impl NodeStorage {
         slot: u8,
         object_id_hex: &str,
     ) -> Result<Option<(ShardDto, String)>> {
+        Self::validate_hex_id(object_id_hex)?;
         for is_custodian in [false, true] {
             if let Some(found) = Self::load_shard_by_role(data_dir, slot, is_custodian, object_id_hex)?
             {
@@ -306,12 +329,14 @@ impl NodeStorage {
         Ok(None)
     }
 
-    pub fn load_slot_meta(
+    pub fn load_slot_meta_for_object(
         data_dir: &Path,
         slot: u8,
         is_custodian: bool,
+        object_id_hex: &str,
     ) -> Result<Option<SlotMeta>> {
-        let path = Self::meta_path(data_dir, slot, is_custodian);
+        Self::validate_hex_id(object_id_hex)?;
+        let path = Self::meta_path(data_dir, slot, is_custodian, object_id_hex);
         if !path.exists() {
             return Ok(None);
         }
@@ -319,27 +344,58 @@ impl NodeStorage {
         Ok(Some(meta))
     }
 
+    pub fn load_slot_meta(
+        data_dir: &Path,
+        slot: u8,
+        is_custodian: bool,
+    ) -> Result<Option<SlotMeta>> {
+        let dir = Self::slots_dir(data_dir);
+        if !dir.exists() {
+            return Ok(None);
+        }
+        let prefix = if is_custodian { "custodian_" } else { "" };
+        let file_prefix = format!("{prefix}slot_{slot}_");
+        let mut best: Option<SlotMeta> = None;
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !name.starts_with(&file_prefix) || !name.ends_with("_meta.json") {
+                continue;
+            }
+            let meta: SlotMeta = serde_json::from_slice(&fs::read(&path)?)?;
+            if meta.slot != slot || meta.is_custodian != is_custodian {
+                continue;
+            }
+            let replace = match &best {
+                None => true,
+                Some(prev) => {
+                    (meta.generation, &meta.object_id_hex)
+                        > (prev.generation, &prev.object_id_hex)
+                }
+            };
+            if replace {
+                best = Some(meta);
+            }
+        }
+        Ok(best)
+    }
+
     pub fn remove_custodian_shard(
         data_dir: &Path,
         slot: u8,
         object_id_hex: &str,
     ) -> Result<()> {
+        Self::validate_hex_id(object_id_hex)?;
         let shard_path = Self::shard_path(data_dir, slot, true, object_id_hex);
         if shard_path.exists() {
             fs::remove_file(shard_path)?;
         }
-        let meta_path = Self::meta_path(data_dir, slot, true);
+        let meta_path = Self::meta_path(data_dir, slot, true, object_id_hex);
         if meta_path.exists() {
-            let remove_meta = match fs::read(&meta_path)
-                .ok()
-                .and_then(|b| serde_json::from_slice::<SlotMeta>(&b).ok())
-            {
-                Some(meta) => meta.object_id_hex == object_id_hex,
-                None => true,
-            };
-            if remove_meta {
-                fs::remove_file(meta_path)?;
-            }
+            fs::remove_file(meta_path)?;
         }
         Ok(())
     }
@@ -379,10 +435,10 @@ impl NodeStorage {
     }
 
     pub fn save_manifest(data_dir: &Path, manifest: &SwarmManifestDto) -> Result<()> {
-        atomic_write(
-            &data_dir.join("swarm_manifest.json"),
-            &serde_json::to_vec_pretty(manifest)?,
-        )
+        let per_file = Self::manifest_path(data_dir, &manifest.object_id_hex)?;
+        let bytes = serde_json::to_vec_pretty(manifest)?;
+        atomic_write(&per_file, &bytes)?;
+        atomic_write(&data_dir.join("swarm_manifest.json"), &bytes)
     }
 
     pub fn load_manifest(data_dir: &Path) -> Result<Option<SwarmManifestDto>> {
@@ -392,6 +448,45 @@ impl NodeStorage {
         }
         let manifest: SwarmManifestDto = serde_json::from_slice(&fs::read(path)?)?;
         Ok(Some(manifest))
+    }
+
+    pub fn load_manifest_for_object(
+        data_dir: &Path,
+        object_id_hex: Option<&str>,
+    ) -> Result<Option<SwarmManifestDto>> {
+        match object_id_hex {
+            Some(obj_id) if !obj_id.is_empty() => {
+                let path = Self::manifest_path(data_dir, obj_id)?;
+                if path.exists() {
+                    let manifest: SwarmManifestDto = serde_json::from_slice(&fs::read(path)?)?;
+                    return Ok(Some(manifest));
+                }
+                if let Some(latest) = Self::load_manifest(data_dir)? {
+                    if latest.object_id_hex.eq_ignore_ascii_case(obj_id) {
+                        return Ok(Some(latest));
+                    }
+                }
+                Ok(None)
+            }
+            _ => Self::load_manifest(data_dir),
+        }
+    }
+
+    pub fn list_manifests(data_dir: &Path) -> Result<Vec<SwarmManifestDto>> {
+        let dir = Self::manifests_dir(data_dir);
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut manifests = Vec::new();
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("json") {
+                let m: SwarmManifestDto = serde_json::from_slice(&fs::read(&path)?)?;
+                manifests.push(m);
+            }
+        }
+        Ok(manifests)
     }
 }
 
@@ -577,5 +672,71 @@ mod tests {
         assert!(NodeStorage::load_shard(&dir.path, 4, &dto.object_id_hex)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn node_storage_multifile_manifests_and_per_file_generations() {
+        let dir = TempDir::new("multifile");
+        let shards_a = encode(b"multifile payload alpha", 4, 8, 10).unwrap();
+        let shards_b = encode(b"multifile payload beta", 4, 8, 20).unwrap();
+        let dto_a = ShardDto::from_shard(&shards_a[0]);
+        let dto_b = ShardDto::from_shard(&shards_b[0]);
+        assert_ne!(dto_a.object_id_hex, dto_b.object_id_hex);
+
+        // 파일 A를 generation=1로 저장해도 서로 다른 object_id인 파일 B의 generation=0 저장은 허용되어야 함
+        assert!(NodeStorage::save_shard(&dir.path, 0, false, 1, &dto_a, "pa").unwrap());
+        assert!(NodeStorage::save_shard(&dir.path, 0, false, 0, &dto_b, "pb").unwrap());
+        assert!(!NodeStorage::save_shard(&dir.path, 0, false, 0, &dto_a, "stale").unwrap());
+
+        let manifest_a = SwarmManifestDto {
+            swarm_id: 0,
+            object_id_hex: dto_a.object_id_hex.clone(),
+            root_hex: "aa".repeat(48),
+            slot_fps_hex: vec!["11".repeat(32)],
+            slot_proofs_hex: vec!["22".repeat(48)],
+            custodian_owners: BTreeMap::from([(1u8, 2u8)]),
+            slot_generations: BTreeMap::from([(0u8, 1u64)]),
+        };
+        let manifest_b = SwarmManifestDto {
+            swarm_id: 0,
+            object_id_hex: dto_b.object_id_hex.clone(),
+            root_hex: "bb".repeat(48),
+            slot_fps_hex: vec!["33".repeat(32)],
+            slot_proofs_hex: vec!["44".repeat(48)],
+            custodian_owners: BTreeMap::new(),
+            slot_generations: BTreeMap::new(),
+        };
+
+        NodeStorage::save_manifest(&dir.path, &manifest_a).unwrap();
+        NodeStorage::save_manifest(&dir.path, &manifest_b).unwrap();
+
+        // 최신 기본 manifest는 파일 B지만 object_id 지정 조회 시 파일 A·B 모두 독립 조회 가능
+        assert_eq!(
+            NodeStorage::load_manifest(&dir.path)
+                .unwrap()
+                .unwrap()
+                .object_id_hex,
+            dto_b.object_id_hex
+        );
+        let loaded_a =
+            NodeStorage::load_manifest_for_object(&dir.path, Some(&dto_a.object_id_hex))
+                .unwrap()
+                .unwrap();
+        assert_eq!(loaded_a.root_hex, manifest_a.root_hex);
+        assert_eq!(loaded_a.custodian_owners, manifest_a.custodian_owners);
+
+        let loaded_b =
+            NodeStorage::load_manifest_for_object(&dir.path, Some(&dto_b.object_id_hex))
+                .unwrap()
+                .unwrap();
+        assert_eq!(loaded_b.root_hex, manifest_b.root_hex);
+
+        assert!(
+            NodeStorage::load_manifest_for_object(&dir.path, Some(&"ff".repeat(32)))
+                .unwrap()
+                .is_none()
+        );
+        assert!(NodeStorage::load_manifest_for_object(&dir.path, Some("../escape")).is_err());
+        assert_eq!(NodeStorage::list_manifests(&dir.path).unwrap().len(), 2);
     }
 }

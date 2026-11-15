@@ -216,6 +216,44 @@ impl Executor {
         Ok(())
     }
 
+    /// 대기 풀에 100대(SWARM_SIZE) 이상의 노드가 모이면 VRF+다양성 셔플러로 가상 스웜을 자동 편성한다.
+    pub fn auto_shuffle_standby_swarms(
+        &mut self,
+        kzg: &Kzg,
+        epoch_seed: &[u8; 32],
+        default_bounty: u128,
+    ) -> Result<Vec<u64>> {
+        if self.db.standby_pool.len() < SWARM_SIZE {
+            return Ok(Vec::new());
+        }
+
+        let mut descriptors = Vec::with_capacity(self.db.standby_pool.len());
+        for pk in &self.db.standby_pool {
+            let acc = self.db.nodes.get(pk).ok_or(Error::Unauthorized)?;
+            descriptors.push(crate::shuffler::NodeDescriptor {
+                pubkey_p256: *pk,
+                ip_subnet_hash: acc.ip_subnet_hash,
+                country_code: acc.country_code,
+            });
+        }
+
+        let shuffled = crate::shuffler::shuffle(
+            epoch_seed,
+            &descriptors,
+            &crate::shuffler::ShuffleConfig::default(),
+        )?;
+
+        let mut created_ids = Vec::with_capacity(shuffled.swarms.len());
+        for roster in shuffled.swarms {
+            let next_id = self.db.swarms.keys().max().map(|m| m + 1).unwrap_or(0);
+            let member_root = compute_member_verkle_root(kzg, &roster)?;
+            self.init_swarm(next_id, roster, member_root, [0u8; 48], default_bounty)?;
+            created_ids.push(next_id);
+        }
+        self.db.standby_pool = shuffled.standby_pool;
+        Ok(created_ids)
+    }
+
     pub fn execute(
         &mut self,
         tx: NativeTransaction,
@@ -371,11 +409,24 @@ impl Executor {
 
                 // 3. 로컬 복구 발생 여부에 따른 new_blobs_root 교체 검증
                 if repair_log.is_empty() {
-                    if new_blobs_root != swarm.active_blobs_root {
+                    if swarm.active_blobs_root != [0u8; 48]
+                        && new_blobs_root != swarm.active_blobs_root
+                    {
                         return Err(Error::BadProof);
                     }
                 } else {
                     let audit = repair_audit.as_ref().ok_or(Error::BadProof)?;
+                    let audit_old_root = if swarm.active_blobs_root != [0u8; 48] {
+                        if audit.old_blobs_root != swarm.active_blobs_root {
+                            return Err(Error::BadProof);
+                        }
+                        swarm.active_blobs_root
+                    } else {
+                        if audit.old_blobs_root == [0u8; 48] {
+                            return Err(Error::BadProof);
+                        }
+                        audit.old_blobs_root
+                    };
                     let expected_entry_idx =
                         expected_repair_audit_index(epoch_seed, swarm_id, epoch, repair_log.len());
                     if audit.entry_index != expected_entry_idx {
@@ -401,16 +452,16 @@ impl Executor {
                     let new_eval =
                         bytes_to_scalar(&audit.repaired_eval).map_err(|_| Error::BadProof)?;
 
-                    // 3a. 부모 A, B가 기존 온체인 루트(old_root)에 속하는지 KZG 검증
+                    // 3a. 부모 A, B가 기존 온체인 루트(또는 Zero-Tx 초기 오프체인 루트)에 속하는지 KZG 검증
                     kzg.verify(
-                        &swarm.active_blobs_root,
+                        &audit_old_root,
                         entry.parent_slot_a as usize,
                         a_eval,
                         &audit.parent_a_proof,
                     )
                     .map_err(|_| Error::BadProof)?;
                     kzg.verify(
-                        &swarm.active_blobs_root,
+                        &audit_old_root,
                         entry.parent_slot_b as usize,
                         b_eval,
                         &audit.parent_b_proof,
@@ -459,7 +510,7 @@ impl Executor {
                         let unchanged_scalar =
                             bytes_to_scalar(&audit.unchanged_eval).map_err(|_| Error::BadProof)?;
                         kzg.verify(
-                            &swarm.active_blobs_root,
+                            &audit_old_root,
                             audit.unchanged_slot as usize,
                             unchanged_scalar,
                             &audit.unchanged_old_proof,
@@ -1162,7 +1213,7 @@ mod tests {
     fn checkpoint_rejects_repair_that_modifies_unchanged_slot() {
         use crate::state_db::{RepairAuditProof, RepairEntry};
 
-        let (mut exec, kzg, keys, _roster, fps, _root, epoch_seed) = setup_swarm_executor();
+        let (mut exec, kzg, keys, _roster, fps, root, epoch_seed) = setup_swarm_executor();
         let full_bitmap = (1u128 << SWARM_SIZE) - 1;
         let factor_b = Scalar::from(7u64);
         let entry = RepairEntry {
@@ -1217,6 +1268,7 @@ mod tests {
                 kzg_sample_proof,
                 repair_audit: Some(RepairAuditProof {
                     entry_index: 0,
+                    old_blobs_root: root,
                     parent_a_eval: scalar_to_bytes(&fps[10]),
                     parent_a_proof,
                     parent_b_eval: scalar_to_bytes(&fps[20]),
@@ -1417,5 +1469,147 @@ mod tests {
             )
             .unwrap();
         assert_eq!(fault_receipt.slashed_amount, exec.config.aggregator_fault_slash);
+    }
+
+    #[test]
+    fn auto_shuffle_standby_swarms_forms_swarms_and_retains_remainder() {
+        let mut rng = StdRng::seed_from_u64(7);
+        let kzg = Kzg::setup(SWARM_SIZE - 1, &mut rng);
+        let mut exec = Executor::new(ExecutorConfig::default());
+        let epoch_seed = [0xABu8; 32];
+
+        for i in 0..105u64 {
+            let sk = key_for(i);
+            let subnet = (i / 2) as u16;
+            let country = (i % 8) as u8;
+            let (pk, sig) = sign_registration(&sk, exec.config.chain_id, subnet, country, 1_500);
+            exec.execute(
+                NativeTransaction::RegisterMobileNode {
+                    pubkey_p256: pk,
+                    hw_attestation_sig: sig,
+                    ip_subnet_hash: subnet,
+                    country_code: country,
+                    stake: 1_500,
+                },
+                &kzg,
+                &epoch_seed,
+            )
+            .unwrap();
+        }
+
+        let formed = exec
+            .auto_shuffle_standby_swarms(&kzg, &epoch_seed, 10_000)
+            .unwrap();
+        assert_eq!(formed, vec![0]);
+        assert_eq!(exec.db.swarms.len(), 1);
+        assert_eq!(exec.db.standby_pool.len(), 5);
+        assert_eq!(exec.db.swarms[&0].active_blobs_root, [0u8; 48]);
+        assert_eq!(exec.db.swarms[&0].storage_bounty_pool, 10_000);
+        assert_eq!(exec.db.swarm_rosters[&0].len(), SWARM_SIZE);
+        assert_eq!(
+            exec.db.swarms[&0].member_verkle_root,
+            compute_member_verkle_root(&kzg, &exec.db.swarm_rosters[&0]).unwrap()
+        );
+    }
+
+    #[test]
+    fn checkpoint_allows_zero_root_transition_and_validates_audit_old_root() {
+        use crate::state_db::{RepairAuditProof, RepairEntry};
+
+        let (mut exec, kzg, keys, _roster, fps, root, epoch_seed) = setup_swarm_executor();
+        let full_bitmap = (1u128 << SWARM_SIZE) - 1;
+
+        // 1. active_blobs_root == [0u8; 48] 상태에서 repair_log 없이 초기 루트 전이 허용
+        exec.db.swarms.get_mut(&0).unwrap().active_blobs_root = [0u8; 48];
+        let init_ckpt =
+            build_signed_checkpoint(0, 1, 0, &keys[0], &kzg, &fps, root, full_bitmap, &epoch_seed);
+        exec.execute(init_ckpt, &kzg, &epoch_seed).unwrap();
+        assert_eq!(exec.db.get_swarm(0).unwrap().active_blobs_root, root);
+
+        // 2. active_blobs_root == [0u8; 48] 상태에서 복구가 동반된 체크포인트도 유효한 old_blobs_root로 전이 허용
+        exec.db.swarms.get_mut(&0).unwrap().active_blobs_root = [0u8; 48];
+        exec.db.swarms.get_mut(&0).unwrap().last_epoch_settled = 0;
+
+        let factor_b = Scalar::from(3u64);
+        let entry = RepairEntry {
+            repaired_slot: 5,
+            parent_slot_a: 1,
+            parent_slot_b: 2,
+            factor_b: scalar_to_bytes(&factor_b),
+        };
+        let mut new_fps = fps.clone();
+        new_fps[5] = fps[1] + factor_b * fps[2];
+        let new_root = kzg.commit(&new_fps).unwrap();
+        let repair_log = vec![entry.clone()];
+
+        let sample_index = expected_sample_index(&epoch_seed, 0, 1, SWARM_SIZE);
+        let sample_eval = scalar_to_bytes(&new_fps[sample_index as usize]);
+        let kzg_sample_proof = kzg.open(&new_fps, sample_index as usize).unwrap();
+        let audit_idx = expected_repair_audit_index(&epoch_seed, 0, 1, repair_log.len());
+        assert_eq!(audit_idx, 0);
+        let unchanged_slot =
+            expected_unchanged_slot_index(&epoch_seed, 0, 1, &repair_log, SWARM_SIZE).unwrap();
+        let unchanged_eval = scalar_to_bytes(&fps[unchanged_slot as usize]);
+        let unchanged_old_proof = kzg.open(&fps, unchanged_slot as usize).unwrap();
+        let unchanged_new_proof = kzg.open(&new_fps, unchanged_slot as usize).unwrap();
+
+        let build_repaired_tx = |old_blobs_root: [u8; 48]| {
+            let audit = RepairAuditProof {
+                entry_index: 0,
+                old_blobs_root,
+                parent_a_eval: scalar_to_bytes(&fps[1]),
+                parent_a_proof: kzg.open(&fps, 1).unwrap(),
+                parent_b_eval: scalar_to_bytes(&fps[2]),
+                parent_b_proof: kzg.open(&fps, 2).unwrap(),
+                repaired_eval: scalar_to_bytes(&new_fps[5]),
+                repaired_proof: kzg.open(&new_fps, 5).unwrap(),
+                unchanged_slot,
+                unchanged_eval,
+                unchanged_old_proof,
+                unchanged_new_proof,
+            };
+            let msg = NativeTransaction::checkpoint_signing_bytes(
+                0,
+                1,
+                0,
+                &new_root,
+                &repair_log,
+                full_bitmap,
+                sample_index,
+                &sample_eval,
+            );
+            let sig: Signature = keys[0].sign(&msg);
+            NativeTransaction::SubmitSwarmCheckpoint {
+                swarm_id: 0,
+                epoch: 1,
+                aggregator_slot: 0,
+                new_blobs_root: new_root,
+                repair_log: repair_log.clone(),
+                uptime_bitmap: full_bitmap,
+                sample_index,
+                sample_eval,
+                kzg_sample_proof,
+                repair_audit: Some(audit),
+                aggregator_p256_sig: sig.to_bytes().into(),
+            }
+        };
+
+        // old_blobs_root가 [0u8; 48]이면 거부
+        assert!(matches!(
+            exec.execute(build_repaired_tx([0u8; 48]), &kzg, &epoch_seed),
+            Err(Error::BadProof)
+        ));
+
+        // 올바른 old_blobs_root(=root)면 [0u8; 48] -> new_root 전이 성공
+        exec.execute(build_repaired_tx(root), &kzg, &epoch_seed)
+            .unwrap();
+        assert_eq!(exec.db.get_swarm(0).unwrap().active_blobs_root, new_root);
+
+        // 3. 이미 비영 루트(new_root)가 등록된 후에는 다른 old_blobs_root 제출 거부
+        exec.db.swarms.get_mut(&0).unwrap().last_epoch_settled = 0;
+        assert!(matches!(
+            exec.execute(build_repaired_tx(root), &kzg, &epoch_seed),
+            Err(Error::BadProof)
+        ));
     }
 }

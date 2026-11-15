@@ -54,6 +54,7 @@ pub struct RepairEntry {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepairAuditProof {
     pub entry_index: usize,
+    pub old_blobs_root: [u8; 48],
     pub parent_a_eval: [u8; 32],
     pub parent_a_proof: [u8; 48],
     pub parent_b_eval: [u8; 32],

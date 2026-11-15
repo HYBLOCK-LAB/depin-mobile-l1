@@ -209,6 +209,31 @@ impl Kzg {
         self.commit_coeffs(&q)
     }
 
+    /// 도메인 {0, 1, ..., values.len()-1} 전체 슬롯에 대한 KZG 몫 다항식 증명을 단일 보간으로 일괄 생성한다.
+    pub fn open_all(&self, values: &[Scalar]) -> Result<Vec<KzgProof>> {
+        if values.is_empty() || values.len() > self.powers_g1.len() {
+            return Err(Error::InvalidInput);
+        }
+        let p = interpolate(values)?;
+        let n = p.len();
+        if n <= 1 {
+            return Ok(vec![g1_to_bytes(&G1Affine::zero()); values.len()]);
+        }
+        let mut proofs = Vec::with_capacity(values.len());
+        let mut q = vec![Scalar::ZERO; n - 1];
+        for index in 0..values.len() {
+            let z = Scalar::from(index as u64);
+            let mut rem = p[n - 1];
+            q[n - 2] = rem;
+            for i in (1..n - 1).rev() {
+                rem = p[i] + rem * z;
+                q[i - 1] = rem;
+            }
+            proofs.push(self.commit_coeffs(&q)?);
+        }
+        Ok(proofs)
+    }
+
     /// 페어링 등식 검증: e(C - [value]G1, G2) == e(proof, [tau]G2 - [index]G2)
     pub fn verify(
         &self,
@@ -276,6 +301,12 @@ mod tests {
             // 잘못된 값이나 인덱스 위조는 실패해야 함
             let wrong = values[idx] + Scalar::ONE;
             assert!(kzg.verify(&root, idx, wrong, &proof).is_err());
+        }
+
+        let all_proofs = kzg.open_all(&values).unwrap();
+        assert_eq!(all_proofs.len(), values.len());
+        for idx in [0, 7, 45, 99] {
+            assert_eq!(all_proofs[idx], kzg.open(&values, idx).unwrap());
         }
 
         // 1단계 동형 지문 + 2단계 점 덧셈 동형성 일치 검증

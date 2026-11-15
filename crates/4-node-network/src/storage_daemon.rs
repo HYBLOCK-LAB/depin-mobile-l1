@@ -1,23 +1,27 @@
-use crate::l1_daemon::DEFAULT_KZG_SEED;
-use crate::persistence::{load_or_create_signing_key, NodeStorage, ValidatorStorage};
+use crate::l1_daemon::{DEFAULT_EPOCH_SEED, DEFAULT_KZG_SEED};
+use crate::persistence::{
+    compressed_pubkey, deterministic_signing_key, load_or_create_signing_key, NodeStorage,
+    ValidatorStorage,
+};
 use crate::wire::{
     decode_fixed_hex, http_request_json, proof_from_hex, read_frame, read_http_request,
     root_from_hex, send_p2p, spawn_tcp_server, write_frame, write_http_json, CycleReportDto,
     FinalizedBlockDto, L1StatusDto, P2pRequest, P2pResponse, ShardDto, SlotAssignmentDto,
-    SwarmClusterMapDto, TxDto,
+    SwarmClusterMapDto, SwarmManifestDto, TxDto,
 };
 use crate::{Error, Result};
 use l1_state_engine::executor::{
     expected_repair_audit_index, expected_sample_index, expected_unchanged_slot_index,
     heartbeat_signing_bytes, sign_registration,
 };
+use l1_state_engine::shuffler::score_node;
 use l1_state_engine::state_db::{NativeTransaction, RepairAuditProof, RepairEntry, SWARM_SIZE};
 use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinSet;
 use verkle_fountain::fountain::{rank, repair_local_field, Shard};
@@ -84,10 +88,42 @@ struct ErrorResponse {
 #[derive(Deserialize)]
 struct RunCycleBody {
     epoch: u64,
+    #[serde(default)]
+    object_id_hex: Option<String>,
+}
+
+fn sorted_slot_keys() -> &'static [(u64, SigningKey, [u8; 33])] {
+    static SORTED: OnceLock<Vec<(u64, SigningKey, [u8; 33])>> = OnceLock::new();
+    SORTED.get_or_init(|| {
+        let mut entries: Vec<(u64, SigningKey, [u8; 33], [u8; 32])> = (0..SWARM_SIZE)
+            .map(|i| {
+                let raw_seed = 5000 + i as u64;
+                let sk = deterministic_signing_key(raw_seed);
+                let pk = compressed_pubkey(&sk);
+                let score = score_node(&pk, &DEFAULT_EPOCH_SEED);
+                (raw_seed, sk, pk, score)
+            })
+            .collect();
+        entries.sort_by(|a, b| a.3.cmp(&b.3).then_with(|| a.2.cmp(&b.2)));
+        entries
+            .into_iter()
+            .map(|(seed, sk, pk, _)| (seed, sk, pk))
+            .collect()
+    })
 }
 
 pub fn slot_key_seed(slot: u8) -> u64 {
-    5000 + slot as u64
+    sorted_slot_keys()
+        .get(slot as usize)
+        .map(|(seed, _, _)| *seed)
+        .unwrap_or(5000 + slot as u64)
+}
+
+pub fn slot_signing_key(slot: u8) -> SigningKey {
+    sorted_slot_keys()
+        .get(slot as usize)
+        .map(|(_, sk, _)| sk.clone())
+        .unwrap_or_else(|| deterministic_signing_key(5000 + slot as u64))
 }
 
 pub async fn start_storage_daemon(config: StorageDaemonConfig) -> Result<StorageDaemonHandle> {
@@ -236,7 +272,12 @@ async fn handle_storage_p2p(mut stream: TcpStream, state: Arc<StorageRuntimeStat
         } => {
             let loaded_shard =
                 NodeStorage::load_shard_by_role(&state.data_dir, slot, true, &object_id_hex)?;
-            let loaded_meta = NodeStorage::load_slot_meta(&state.data_dir, slot, true)?;
+            let loaded_meta = NodeStorage::load_slot_meta_for_object(
+                &state.data_dir,
+                slot,
+                true,
+                &object_id_hex,
+            )?;
             match (loaded_shard, loaded_meta) {
                 (Some((shard, proof_hex)), Some(meta)) => {
                     match target_p2p_addr.parse::<SocketAddr>() {
@@ -348,6 +389,35 @@ async fn handle_storage_rpc(mut stream: TcpStream, state: Arc<StorageRuntimeStat
                 .await?
             }
         },
+        ("GET", p) if p.starts_with("/manifest/") => {
+            let object_id_hex = p.strip_prefix("/manifest/").unwrap_or("");
+            if object_id_hex.is_empty()
+                || !object_id_hex.bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                write_http_json(
+                    &mut stream,
+                    400,
+                    &ErrorResponse {
+                        error: "invalid object_id_hex".into(),
+                    },
+                )
+                .await?;
+            } else {
+                match NodeStorage::load_manifest_for_object(&state.data_dir, Some(object_id_hex))? {
+                    Some(manifest) => write_http_json(&mut stream, 200, &manifest).await?,
+                    None => {
+                        write_http_json(
+                            &mut stream,
+                            404,
+                            &ErrorResponse {
+                                error: format!("manifest not found for object {object_id_hex}"),
+                            },
+                        )
+                        .await?
+                    }
+                }
+            }
+        }
         ("POST", "/register_slots") => {
             let mut txs = Vec::with_capacity(state.slot_keys.len());
             for (&slot, sk) in &state.slot_keys {
@@ -381,7 +451,7 @@ async fn handle_storage_rpc(mut stream: TcpStream, state: Arc<StorageRuntimeStat
         ("POST", "/aggregator/run_cycle") => {
             let req: RunCycleBody = serde_json::from_slice(&body)
                 .map_err(|e| Error::Network(format!("invalid run_cycle json: {e}")))?;
-            match execute_aggregator_cycle(&state, req.epoch).await {
+            match execute_aggregator_cycle(&state, req.epoch, req.object_id_hex.as_deref()).await {
                 Ok(report) => write_http_json(&mut stream, 200, &report).await?,
                 Err(e) => {
                     write_http_json(&mut stream, 400, &ErrorResponse { error: e.to_string() })
@@ -496,9 +566,38 @@ async fn fetch_accessible_shards(
     Ok(out)
 }
 
+fn select_cycle_manifest(
+    state: &StorageRuntimeState,
+    l1_status: &L1StatusDto,
+    requested_object_id: Option<&str>,
+) -> Result<SwarmManifestDto> {
+    if requested_object_id.is_some() {
+        return NodeStorage::load_manifest_for_object(&state.data_dir, requested_object_id)?
+            .ok_or_else(|| Error::Network("requested object manifest missing on node".into()));
+    }
+    if let Some(sw) = l1_status.swarms.iter().find(|s| s.swarm_id == state.swarm_id) {
+        if sw.state.active_blobs_root != [0u8; 48] {
+            let target_root_hex = hex::encode(sw.state.active_blobs_root);
+            if let Some(latest) = NodeStorage::load_manifest(&state.data_dir)? {
+                if latest.root_hex == target_root_hex {
+                    return Ok(latest);
+                }
+            }
+            for m in NodeStorage::list_manifests(&state.data_dir)? {
+                if m.root_hex == target_root_hex {
+                    return Ok(m);
+                }
+            }
+        }
+    }
+    NodeStorage::load_manifest(&state.data_dir)?
+        .ok_or_else(|| Error::Network("swarm manifest missing on node".into()))
+}
+
 async fn execute_aggregator_cycle(
     state: &StorageRuntimeState,
     epoch: u64,
+    object_id_hex: Option<&str>,
 ) -> Result<CycleReportDto> {
     let local_hint_slot = *state
         .slot_keys
@@ -548,8 +647,11 @@ async fn execute_aggregator_cycle(
     }
     while receipt_set.join_next().await.is_some() {}
 
-    let mut manifest = NodeStorage::load_manifest(&state.data_dir)?
-        .ok_or_else(|| Error::Network("swarm manifest missing on node".into()))?;
+    let l1_status: L1StatusDto =
+        http_request_json::<(), L1StatusDto>(&state.l1_rpc_url, "GET", "/status", None).await?;
+    let epoch_seed = decode_fixed_hex::<32>(&l1_status.epoch_seed_hex)?;
+
+    let mut manifest = select_cycle_manifest(state, &l1_status, object_id_hex)?;
 
     let old_root = root_from_hex(&manifest.root_hex)?;
     let old_fps: Vec<Scalar> = manifest
@@ -677,17 +779,11 @@ async fn execute_aggregator_cycle(
         }
     }
 
-    let l1_status: L1StatusDto =
-        http_request_json::<(), L1StatusDto>(&state.l1_rpc_url, "GET", "/status", None).await?;
-    let epoch_seed = decode_fixed_hex::<32>(&l1_status.epoch_seed_hex)?;
-
     let (new_blobs_root, new_proofs) = if repair_log.is_empty() {
         (old_root, old_proofs.clone())
     } else {
         let root = state.kzg.commit(&new_fps)?;
-        let proofs = (0..SWARM_SIZE)
-            .map(|i| state.kzg.open(&new_fps, i))
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let proofs = state.kzg.open_all(&new_fps)?;
         (root, proofs)
     };
 
@@ -716,6 +812,7 @@ async fn execute_aggregator_cycle(
 
         Some(RepairAuditProof {
             entry_index,
+            old_blobs_root: old_root,
             parent_a_eval: scalar_to_bytes(&old_fps[pa]),
             parent_a_proof: old_proofs[pa],
             parent_b_eval: scalar_to_bytes(&old_fps[pb]),

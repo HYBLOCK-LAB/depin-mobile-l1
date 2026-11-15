@@ -146,12 +146,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     SWARM_SIZE - 1,
                     DEFAULT_KZG_SEED,
                 )?;
-                let (manifest, block) =
+                let (manifest, maybe_block) =
                     upload_payload(&l1_rpc, &map, &kzg, &payload, bounty, seed).await?;
                 println!("{}", serde_json::to_string_pretty(&serde_json::json!({
                     "object_id_hex": manifest.object_id_hex,
+                    "swarm_id": manifest.swarm_id,
                     "root_hex": manifest.root_hex,
-                    "block_height": block.header.height,
+                    "block_height": maybe_block.as_ref().map(|b| b.header.height),
                     "payload_bytes": payload.len(),
                 }))?);
             }
