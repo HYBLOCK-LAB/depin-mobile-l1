@@ -131,6 +131,37 @@ pub fn expected_repair_audit_index(
     (val % repair_len as u64) as usize
 }
 
+/// VRF 시드 기반으로 복구되지 않은(unchanged) 슬롯 중 무결성 감사를 수행할 슬롯 1개를 결정론적으로 선택한다.
+pub fn expected_unchanged_slot_index(
+    epoch_seed: &[u8; 32],
+    swarm_id: u64,
+    epoch: u64,
+    repair_log: &[crate::state_db::RepairEntry],
+    swarm_size: usize,
+) -> Option<u8> {
+    if swarm_size == 0 {
+        return None;
+    }
+    let mut h = Sha256::new();
+    h.update(b"depin/vrf-unchanged/v1");
+    h.update(epoch_seed);
+    h.update(swarm_id.to_le_bytes());
+    h.update(epoch.to_le_bytes());
+    let digest = h.finalize();
+    let start =
+        (u64::from_le_bytes(digest[..8].try_into().expect("8 bytes")) % swarm_size as u64) as usize;
+    for offset in 0..swarm_size {
+        let candidate = (start + offset) % swarm_size;
+        if !repair_log
+            .iter()
+            .any(|e| e.repaired_slot as usize == candidate)
+        {
+            return u8::try_from(candidate).ok();
+        }
+    }
+    None
+}
+
 #[derive(Clone, Debug)]
 pub struct Executor {
     pub config: ExecutorConfig,
@@ -288,6 +319,12 @@ impl Executor {
                 if agg_idx >= SWARM_SIZE || (uptime_bitmap & (1u128 << agg_idx)) == 0 {
                     return Err(Error::Unauthorized);
                 }
+                if agg_idx > 0 {
+                    let higher_priority_mask = (1u128 << agg_idx) - 1;
+                    if (uptime_bitmap & higher_priority_mask) != 0 {
+                        return Err(Error::Unauthorized);
+                    }
+                }
 
                 // 1. 제출한 어그리게이터(0번 또는 차순위 승계자)의 TEE P-256 서명 검증
                 let agg_pubkey = roster[agg_idx];
@@ -386,6 +423,39 @@ impl Executor {
                     let c_actual = kzg.commit_fingerprint(new_eval);
                     if c_actual != c_expected {
                         return Err(Error::BadProof);
+                    }
+
+                    // 3d. 비-복구 슬롯 무결성 검증: VRF로 지목된 미복구 슬롯이 old/new 루트에서 동일하게 유지되는지 확인
+                    if let Some(expected_unchanged) = expected_unchanged_slot_index(
+                        epoch_seed,
+                        swarm_id,
+                        epoch,
+                        &repair_log,
+                        SWARM_SIZE,
+                    ) {
+                        if audit.unchanged_slot != expected_unchanged
+                            || repair_log
+                                .iter()
+                                .any(|r| r.repaired_slot == audit.unchanged_slot)
+                        {
+                            return Err(Error::BadProof);
+                        }
+                        let unchanged_scalar =
+                            bytes_to_scalar(&audit.unchanged_eval).map_err(|_| Error::BadProof)?;
+                        kzg.verify(
+                            &swarm.active_blobs_root,
+                            audit.unchanged_slot as usize,
+                            unchanged_scalar,
+                            &audit.unchanged_old_proof,
+                        )
+                        .map_err(|_| Error::BadProof)?;
+                        kzg.verify(
+                            &new_blobs_root,
+                            audit.unchanged_slot as usize,
+                            unchanged_scalar,
+                            &audit.unchanged_new_proof,
+                        )
+                        .map_err(|_| Error::BadProof)?;
                     }
                 }
 
@@ -960,6 +1030,178 @@ mod tests {
                 &epoch_seed,
             ),
             Err(Error::BadEpoch)
+        ));
+    }
+
+    #[test]
+    fn checkpoint_rejects_successor_when_higher_priority_slot_is_online() {
+        let (mut exec, kzg, keys, _roster, fps, root, epoch_seed) = setup_swarm_executor();
+        let full_bitmap = (1u128 << SWARM_SIZE) - 1;
+
+        // 0번 슬롯이 온라인(1)인데 1번 슬롯이 반장으로 제출 시도 -> Unauthorized
+        let tx_slot1_while_0_online =
+            build_signed_checkpoint(0, 1, 1, &keys[1], &kzg, &fps, root, full_bitmap, &epoch_seed);
+        assert!(matches!(
+            exec.execute(tx_slot1_while_0_online, &kzg, &epoch_seed),
+            Err(Error::Unauthorized)
+        ));
+
+        // 0..4번 중 4번만 온라인(1)이어도 5번 승계자는 Unauthorized
+        let bitmap_only_4_online = full_bitmap & !((1u128 << 4) - 1);
+        let tx_slot5_while_4_online = build_signed_checkpoint(
+            0,
+            1,
+            5,
+            &keys[5],
+            &kzg,
+            &fps,
+            root,
+            bitmap_only_4_online,
+            &epoch_seed,
+        );
+        assert!(matches!(
+            exec.execute(tx_slot5_while_4_online, &kzg, &epoch_seed),
+            Err(Error::Unauthorized)
+        ));
+
+        // 0..5번 선순위 슬롯이 모두 오프라인(0)이면 5번 승계자 제출 성공
+        let valid_successor_bitmap = full_bitmap & !((1u128 << 5) - 1);
+        let tx_valid_successor = build_signed_checkpoint(
+            0,
+            1,
+            5,
+            &keys[5],
+            &kzg,
+            &fps,
+            root,
+            valid_successor_bitmap,
+            &epoch_seed,
+        );
+        exec.execute(tx_valid_successor, &kzg, &epoch_seed).unwrap();
+    }
+
+    #[test]
+    fn expected_unchanged_slot_index_skips_repaired_slots_and_handles_full_log() {
+        use crate::state_db::RepairEntry;
+
+        let epoch_seed = [0x42u8; 32];
+        let first = expected_unchanged_slot_index(&epoch_seed, 0, 1, &[], SWARM_SIZE).unwrap();
+        assert!((first as usize) < SWARM_SIZE);
+
+        // VRF가 처음 지목한 슬롯이 repair_log에 포함되면 다음 미복구 슬롯으로 순회
+        let log_with_first = vec![RepairEntry {
+            repaired_slot: first,
+            parent_slot_a: 10,
+            parent_slot_b: 20,
+            factor_b: [1u8; 32],
+        }];
+        let second =
+            expected_unchanged_slot_index(&epoch_seed, 0, 1, &log_with_first, SWARM_SIZE).unwrap();
+        assert_eq!(second, ((first as usize + 1) % SWARM_SIZE) as u8);
+
+        // 모든 슬롯이 repair_log에 있으면 None
+        let full_log: Vec<RepairEntry> = (0..SWARM_SIZE)
+            .map(|s| RepairEntry {
+                repaired_slot: s as u8,
+                parent_slot_a: 0,
+                parent_slot_b: 1,
+                factor_b: [1u8; 32],
+            })
+            .collect();
+        assert!(expected_unchanged_slot_index(&epoch_seed, 0, 1, &full_log, SWARM_SIZE).is_none());
+    }
+
+    #[test]
+    fn checkpoint_rejects_repair_that_modifies_unchanged_slot() {
+        use crate::state_db::{RepairAuditProof, RepairEntry};
+
+        let (mut exec, kzg, keys, _roster, fps, _root, epoch_seed) = setup_swarm_executor();
+        let full_bitmap = (1u128 << SWARM_SIZE) - 1;
+        let factor_b = Scalar::from(7u64);
+        let entry = RepairEntry {
+            repaired_slot: 0,
+            parent_slot_a: 10,
+            parent_slot_b: 20,
+            factor_b: scalar_to_bytes(&factor_b),
+        };
+        let repair_log = vec![entry.clone()];
+
+        let unchanged_slot =
+            expected_unchanged_slot_index(&epoch_seed, 0, 1, &repair_log, SWARM_SIZE).unwrap();
+        assert_ne!(unchanged_slot, 0);
+
+        let mut tampered_fps = fps.clone();
+        tampered_fps[0] = fps[10] + factor_b * fps[20];
+        // 비-복구 슬롯의 지문을 고의로 위변조
+        tampered_fps[unchanged_slot as usize] += Scalar::from(1u64);
+        let tampered_root = kzg.commit(&tampered_fps).unwrap();
+
+        let sample_index = expected_sample_index(&epoch_seed, 0, 1, SWARM_SIZE);
+        let sample_eval = scalar_to_bytes(&tampered_fps[sample_index as usize]);
+        let kzg_sample_proof = kzg.open(&tampered_fps, sample_index as usize).unwrap();
+
+        let parent_a_proof = kzg.open(&fps, 10).unwrap();
+        let parent_b_proof = kzg.open(&fps, 20).unwrap();
+        let repaired_proof = kzg.open(&tampered_fps, 0).unwrap();
+        let unchanged_old_proof = kzg.open(&fps, unchanged_slot as usize).unwrap();
+        let unchanged_new_proof = kzg.open(&tampered_fps, unchanged_slot as usize).unwrap();
+
+        let build_tampered_tx = |unchanged_eval_scalar: Scalar| {
+            let msg = NativeTransaction::checkpoint_signing_bytes(
+                0,
+                1,
+                1,
+                &tampered_root,
+                &repair_log,
+                full_bitmap & !1u128,
+                sample_index,
+                &sample_eval,
+            );
+            let sig: Signature = keys[1].sign(&msg);
+            NativeTransaction::SubmitSwarmCheckpoint {
+                swarm_id: 0,
+                epoch: 1,
+                aggregator_slot: 1,
+                new_blobs_root: tampered_root,
+                repair_log: repair_log.clone(),
+                uptime_bitmap: full_bitmap & !1u128,
+                sample_index,
+                sample_eval,
+                kzg_sample_proof,
+                repair_audit: Some(RepairAuditProof {
+                    entry_index: 0,
+                    parent_a_eval: scalar_to_bytes(&fps[10]),
+                    parent_a_proof,
+                    parent_b_eval: scalar_to_bytes(&fps[20]),
+                    parent_b_proof,
+                    repaired_eval: scalar_to_bytes(&tampered_fps[0]),
+                    repaired_proof,
+                    unchanged_slot,
+                    unchanged_eval: scalar_to_bytes(&unchanged_eval_scalar),
+                    unchanged_old_proof,
+                    unchanged_new_proof,
+                }),
+                aggregator_p256_sig: sig.to_bytes().into(),
+            }
+        };
+
+        // old eval 기준 제출 -> new_root 검증 실패 (BadProof)
+        assert!(matches!(
+            exec.execute(
+                build_tampered_tx(fps[unchanged_slot as usize]),
+                &kzg,
+                &epoch_seed
+            ),
+            Err(Error::BadProof)
+        ));
+        // new eval 기준 제출 -> old_root 검증 실패 (BadProof)
+        assert!(matches!(
+            exec.execute(
+                build_tampered_tx(tampered_fps[unchanged_slot as usize]),
+                &kzg,
+                &epoch_seed
+            ),
+            Err(Error::BadProof)
         ));
     }
 }

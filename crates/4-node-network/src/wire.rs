@@ -18,7 +18,8 @@ use verkle_fountain::verkle_kzg::{bytes_to_scalar, scalar_to_bytes, KzgProof, Kz
 
 const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
-const IO_TIMEOUT: Duration = Duration::from_secs(10);
+const IO_TIMEOUT: Duration = Duration::from_secs(30);
+const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub fn decode_fixed_hex<const N: usize>(s: &str) -> Result<[u8; N]> {
     let raw = hex::decode(s).map_err(|e| Error::Network(format!("invalid hex: {e}")))?;
@@ -122,6 +123,10 @@ pub struct RepairAuditProofDto {
     pub parent_b_proof_hex: String,
     pub repaired_eval_hex: String,
     pub repaired_proof_hex: String,
+    pub unchanged_slot: u8,
+    pub unchanged_eval_hex: String,
+    pub unchanged_old_proof_hex: String,
+    pub unchanged_new_proof_hex: String,
 }
 
 impl From<&RepairAuditProof> for RepairAuditProofDto {
@@ -134,6 +139,10 @@ impl From<&RepairAuditProof> for RepairAuditProofDto {
             parent_b_proof_hex: hex::encode(p.parent_b_proof),
             repaired_eval_hex: hex::encode(p.repaired_eval),
             repaired_proof_hex: hex::encode(p.repaired_proof),
+            unchanged_slot: p.unchanged_slot,
+            unchanged_eval_hex: hex::encode(p.unchanged_eval),
+            unchanged_old_proof_hex: hex::encode(p.unchanged_old_proof),
+            unchanged_new_proof_hex: hex::encode(p.unchanged_new_proof),
         }
     }
 }
@@ -149,6 +158,10 @@ impl TryFrom<&RepairAuditProofDto> for RepairAuditProof {
             parent_b_proof: decode_fixed_hex::<48>(&d.parent_b_proof_hex)?,
             repaired_eval: decode_fixed_hex::<32>(&d.repaired_eval_hex)?,
             repaired_proof: decode_fixed_hex::<48>(&d.repaired_proof_hex)?,
+            unchanged_slot: d.unchanged_slot,
+            unchanged_eval: decode_fixed_hex::<32>(&d.unchanged_eval_hex)?,
+            unchanged_old_proof: decode_fixed_hex::<48>(&d.unchanged_old_proof_hex)?,
+            unchanged_new_proof: decode_fixed_hex::<48>(&d.unchanged_new_proof_hex)?,
         })
     }
 }
@@ -569,6 +582,15 @@ pub enum P2pRequest {
         from_slot: u8,
         target_slot: u8,
         epoch: u64,
+        #[serde(default)]
+        aggregator_sig_hex: String,
+    },
+    IssueHeartbeatReceipt {
+        swarm_id: u64,
+        epoch: u64,
+        target_slot: u8,
+        aggregator_slot: u8,
+        sig_hex: String,
     },
     StoreShard {
         slot: u8,
@@ -576,6 +598,11 @@ pub enum P2pRequest {
         generation: u64,
         shard: ShardDto,
         proof_hex: String,
+    },
+    HandoffShard {
+        slot: u8,
+        object_id_hex: String,
+        target_p2p_addr: String,
     },
     FetchShard {
         slot: u8,
@@ -704,7 +731,7 @@ pub async fn http_request_json<B: Serialize, R: DeserializeOwned>(
     .map_err(|_| Error::Network("http write timeout".into()))??;
 
     let mut raw = Vec::new();
-    tokio::time::timeout(IO_TIMEOUT, stream.read_to_end(&mut raw))
+    tokio::time::timeout(HTTP_READ_TIMEOUT, stream.read_to_end(&mut raw))
         .await
         .map_err(|_| Error::Network("http read timeout".into()))??;
 
@@ -889,6 +916,10 @@ mod tests {
                     parent_b_proof: [0x99; 48],
                     repaired_eval: [0xAA; 32],
                     repaired_proof: [0xBB; 48],
+                    unchanged_slot: 1,
+                    unchanged_eval: [0xCD; 32],
+                    unchanged_old_proof: [0xDE; 48],
+                    unchanged_new_proof: [0xEF; 48],
                 }),
                 aggregator_p256_sig: [0xCC; 64],
             },
@@ -967,6 +998,7 @@ mod tests {
                     from_slot: 1,
                     target_slot: 2,
                     epoch: 7,
+                    aggregator_sig_hex: String::new(),
                 },
             )
             .await
@@ -1018,5 +1050,56 @@ mod tests {
             );
             http_task.abort();
         });
+    }
+
+    #[test]
+    fn p2p_ping_serde_default_and_new_variants_roundtrip() {
+        // 기존 포맷(aggregator_sig_hex 생략) 역직렬화 호환성 확인
+        let legacy_json = br#"{"Ping":{"from_slot":0,"target_slot":5,"epoch":2}}"#;
+        let parsed: P2pRequest = serde_json::from_slice(legacy_json).unwrap();
+        assert!(matches!(
+            parsed,
+            P2pRequest::Ping {
+                from_slot: 0,
+                target_slot: 5,
+                epoch: 2,
+                aggregator_sig_hex,
+            } if aggregator_sig_hex.is_empty()
+        ));
+
+        let receipt_req = P2pRequest::IssueHeartbeatReceipt {
+            swarm_id: 1,
+            epoch: 4,
+            target_slot: 9,
+            aggregator_slot: 0,
+            sig_hex: "aa".repeat(64),
+        };
+        let encoded_receipt = serde_json::to_vec(&receipt_req).unwrap();
+        let decoded_receipt: P2pRequest = serde_json::from_slice(&encoded_receipt).unwrap();
+        assert!(matches!(
+            decoded_receipt,
+            P2pRequest::IssueHeartbeatReceipt {
+                swarm_id: 1,
+                epoch: 4,
+                target_slot: 9,
+                aggregator_slot: 0,
+                ..
+            }
+        ));
+
+        let handoff_req = P2pRequest::HandoffShard {
+            slot: 7,
+            object_id_hex: "11".repeat(32),
+            target_p2p_addr: "127.0.0.1:19999".into(),
+        };
+        let encoded_handoff = serde_json::to_vec(&handoff_req).unwrap();
+        let decoded_handoff: P2pRequest = serde_json::from_slice(&encoded_handoff).unwrap();
+        assert!(matches!(
+            decoded_handoff,
+            P2pRequest::HandoffShard {
+                slot: 7,
+                ..
+            }
+        ));
     }
 }

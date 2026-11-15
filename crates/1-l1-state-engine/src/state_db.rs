@@ -59,6 +59,10 @@ pub struct RepairAuditProof {
     pub parent_b_proof: [u8; 48],
     pub repaired_eval: [u8; 32],
     pub repaired_proof: [u8; 48],
+    pub unchanged_slot: u8,
+    pub unchanged_eval: [u8; 32],
+    pub unchanged_old_proof: [u8; 48],
+    pub unchanged_new_proof: [u8; 48],
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

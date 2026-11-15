@@ -1,7 +1,8 @@
 use crate::lazy_repair_fsm::{LazyRepairFsm, NodeState};
 use crate::{Error, Result};
 use l1_state_engine::executor::{
-    expected_repair_audit_index, expected_sample_index, heartbeat_signing_bytes,
+    expected_repair_audit_index, expected_sample_index, expected_unchanged_slot_index,
+    heartbeat_signing_bytes,
 };
 use l1_state_engine::state_db::{NativeTransaction, RepairAuditProof, RepairEntry, SWARM_SIZE};
 use p256::ecdsa::{signature::Signer, Signature, SigningKey};
@@ -79,8 +80,21 @@ pub fn build_checkpoint_with_bitmap(
     if agg_idx >= SWARM_SIZE || fsm.slots[agg_idx].state != NodeState::Online {
         return Err(Error::CoordinatorFailed);
     }
+    if old_fingerprints.len() != SWARM_SIZE {
+        return Err(Error::Invalid);
+    }
 
-    let new_fps = fsm.slot_fingerprints();
+    // 복구되지 않은 죽은 슬롯(shard == None)은 기존 온체인 지문(old_fingerprints)을 유지한다.
+    let new_fps: Vec<Scalar> = fsm
+        .slots
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            s.shard
+                .as_ref()
+                .map_or(old_fingerprints[i], |sh| sh.fingerprint())
+        })
+        .collect();
     let new_blobs_root = kzg
         .commit(&new_fps)
         .map_err(|_| Error::CoordinatorFailed)?;
@@ -94,7 +108,7 @@ pub fn build_checkpoint_with_bitmap(
     let repair_audit = if repair_log.is_empty() {
         None
     } else {
-        if old_fingerprints.len() != SWARM_SIZE || old_proofs.len() != SWARM_SIZE {
+        if old_proofs.len() != SWARM_SIZE {
             return Err(Error::Invalid);
         }
         let entry_index =
@@ -108,6 +122,14 @@ pub fn build_checkpoint_with_bitmap(
             .open(&new_fps, pr)
             .map_err(|_| Error::CoordinatorFailed)?;
 
+        let unchanged_slot =
+            expected_unchanged_slot_index(epoch_seed, swarm_id, epoch, &repair_log, SWARM_SIZE)
+                .ok_or(Error::CoordinatorFailed)?;
+        let unchanged_idx = unchanged_slot as usize;
+        let unchanged_new_proof = kzg
+            .open(&new_fps, unchanged_idx)
+            .map_err(|_| Error::CoordinatorFailed)?;
+
         Some(RepairAuditProof {
             entry_index,
             parent_a_eval: scalar_to_bytes(&old_fingerprints[pa]),
@@ -116,6 +138,10 @@ pub fn build_checkpoint_with_bitmap(
             parent_b_proof: old_proofs[pb],
             repaired_eval: scalar_to_bytes(&new_fps[pr]),
             repaired_proof,
+            unchanged_slot,
+            unchanged_eval: scalar_to_bytes(&old_fingerprints[unchanged_idx]),
+            unchanged_old_proof: old_proofs[unchanged_idx],
+            unchanged_new_proof,
         })
     };
 
