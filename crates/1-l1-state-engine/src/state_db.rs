@@ -280,6 +280,35 @@ impl EnshrinedSwarmDB {
             .get(&swarm_id)
             .ok_or(crate::Error::InvalidInput)
     }
+
+    /// 특정 모바일 노드의 계정 상태를 조회한다.
+    pub fn get_node(&self, pubkey: &[u8; 33]) -> Result<&NodeAccount> {
+        self.nodes
+            .get(pubkey)
+            .ok_or(crate::Error::InvalidInput)
+    }
+
+    /// 노드가 배정된 스웜 ID와 슬롯 번호(0..99)를 역추적한다.
+    pub fn find_node_slot(&self, pubkey: &[u8; 33]) -> Option<(u64, u8)> {
+        self.swarm_rosters.iter().find_map(|(&swarm_id, roster)| {
+            roster
+                .iter()
+                .position(|node_pubkey| node_pubkey == pubkey)
+                .map(|slot| (swarm_id, slot as u8))
+        })
+    }
+
+    /// 슬래싱되지 않은 정상 활성 노드 수를 집계한다.
+    pub fn active_node_count(&self) -> usize {
+        self.nodes.values().filter(|node| !node.slashed).count()
+    }
+
+    /// 네트워크 전체 노드의 스테이킹 예치금 총액을 합산한다.
+    pub fn total_staked_amount(&self) -> u128 {
+        self.nodes
+            .values()
+            .fold(0u128, |acc, node| acc.saturating_add(node.stake))
+    }
 }
 
 #[cfg(test)]
@@ -508,5 +537,68 @@ mod tests {
                 &alt_eval,
             )
         );
+    }
+
+    #[test]
+    fn enshrined_db_node_query_and_stats_helpers() {
+        // 1. 빈 DB 생성
+        let mut db = EnshrinedSwarmDB::default();
+
+        assert_eq!(db.active_node_count(), 0);
+        assert_eq!(db.total_staked_amount(), 0);
+
+        // 2. 테스트용 노드 식별자 생성
+        let node_a = [1u8; 33];
+        let node_b = [2u8; 33];
+        let node_c = [3u8; 33];
+        let node_d = [4u8; 33]; // 미등록 노드 조회용
+
+        // 3. A, B, C 등록: B만 슬래싱된 상태
+        for (pubkey, stake, slashed) in [
+            (node_a, 100u128, false),
+            (node_b, 200u128, true),
+            (node_c, 300u128, false),
+        ] {
+            db.nodes.insert(
+                pubkey,
+                NodeAccount {
+                    pubkey_p256: pubkey,
+                    ip_subnet_hash: 0,
+                    country_code: 0,
+                    stake,
+                    reward_balance: 0,
+                    consecutive_offline_epochs: 0,
+                    slashed,
+                },
+            );
+        }
+
+        // 4. 스웜 7에 A와 B 배정. C는 대기열에 둠
+        db.swarm_rosters.insert(7, vec![node_a, node_b]);
+        db.standby_pool.push(node_c);
+
+        // 5. 등록된 노드의 계정 조회 확인
+        let account = db.get_node(&node_a).unwrap();
+        assert_eq!(account.pubkey_p256, node_a);
+        assert_eq!(account.stake, 100);
+        assert!(!account.slashed);
+
+        // 6. 미등록 노드를 조회하면 지정된 에러 반환
+        assert!(matches!(
+            db.get_node(&node_d),
+            Err(crate::Error::InvalidInput)
+        ));
+
+        // 7. 스웜 및 슬롯 위치 확인
+        assert_eq!(db.find_node_slot(&node_a), Some((7, 0)));
+        assert_eq!(db.find_node_slot(&node_b), Some((7, 1)));
+        assert_eq!(db.find_node_slot(&node_c), None);
+        assert_eq!(db.find_node_slot(&node_d), None);
+
+        // 8. 정상 노드는 A, C의 2명
+        assert_eq!(db.active_node_count(), 2);
+
+        // 9. 스테이크는 슬래싱된 B도 포함: 100 + 200 + 300
+        assert_eq!(db.total_staked_amount(), 600);
     }
 }
