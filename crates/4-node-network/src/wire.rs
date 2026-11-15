@@ -18,7 +18,7 @@ use verkle_fountain::verkle_kzg::{bytes_to_scalar, scalar_to_bytes, KzgProof, Kz
 
 const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
-const IO_TIMEOUT: Duration = Duration::from_secs(30);
+const IO_TIMEOUT: Duration = Duration::from_secs(60);
 const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub fn decode_fixed_hex<const N: usize>(s: &str) -> Result<[u8; N]> {

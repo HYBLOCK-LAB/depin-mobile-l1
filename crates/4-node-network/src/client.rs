@@ -1,11 +1,11 @@
 use crate::persistence::{compressed_pubkey, deterministic_signing_key};
 use crate::storage_daemon::slot_key_seed;
 use crate::wire::{
-    http_request_json, send_p2p, FinalizedBlockDto, InitSwarmRequest, P2pRequest, P2pResponse,
-    ShardDto, SlotAssignmentDto, SwarmClusterMapDto, SwarmManifestDto,
+    decode_fixed_hex, http_request_json, send_p2p, FinalizedBlockDto, InitSwarmRequest, P2pRequest,
+    P2pResponse, ShardDto, SlotAssignmentDto, SwarmClusterMapDto, SwarmManifestDto,
 };
 use crate::{Error, Result};
-use l1_state_engine::state_db::SWARM_SIZE;
+use l1_state_engine::state_db::{compute_member_verkle_root, SWARM_SIZE};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use tokio::task::JoinSet;
@@ -90,11 +90,16 @@ pub async fn upload_payload(
         .iter()
         .map(|s| s.pubkey_hex.clone())
         .collect();
+    let roster_pks: Vec<[u8; 33]> = roster_pubkeys_hex
+        .iter()
+        .map(|h| decode_fixed_hex::<33>(h))
+        .collect::<Result<Vec<_>>>()?;
+    let member_verkle_root = compute_member_verkle_root(kzg, &roster_pks)?;
     let root_hex = hex::encode(root);
     let init_req = InitSwarmRequest {
         swarm_id: cluster_map.swarm_id,
         roster_pubkeys_hex,
-        member_verkle_root_hex: hex::encode([0x22u8; 48]),
+        member_verkle_root_hex: hex::encode(member_verkle_root),
         active_blobs_root_hex: root_hex.clone(),
         initial_bounty,
     };

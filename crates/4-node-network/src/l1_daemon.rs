@@ -12,7 +12,7 @@ use l1_state_engine::consensus::{
     Vote, VotePhase,
 };
 use l1_state_engine::executor::{Executor, ExecutorConfig};
-use l1_state_engine::state_db::{NativeTransaction, SWARM_SIZE};
+use l1_state_engine::state_db::{compute_member_verkle_root, NativeTransaction, SWARM_SIZE};
 use p256::ecdsa::SigningKey;
 use serde::Serialize;
 use std::net::SocketAddr;
@@ -104,13 +104,17 @@ fn build_validator_set(
     Ok((infos, own))
 }
 
-fn apply_init_swarm(exec: &mut Executor, req: &InitSwarmRequest) -> Result<()> {
+fn apply_init_swarm(exec: &mut Executor, kzg: &Kzg, req: &InitSwarmRequest) -> Result<()> {
     let roster = req
         .roster_pubkeys_hex
         .iter()
         .map(|h| decode_fixed_hex::<33>(h))
         .collect::<Result<Vec<_>>>()?;
     let member_root = root_from_hex(&req.member_verkle_root_hex)?;
+    let expected_member_root = compute_member_verkle_root(kzg, &roster)?;
+    if member_root != expected_member_root {
+        return Err(Error::L1(l1_state_engine::Error::BadProof));
+    }
     let blobs_root = root_from_hex(&req.active_blobs_root_hex)?;
     exec.init_swarm(
         req.swarm_id,
@@ -131,7 +135,7 @@ fn execute_stage(
 ) -> Result<(Executor, Vec<l1_state_engine::executor::ExecutionReceipt>)> {
     let mut staged = base.clone();
     for init_req in init_swarms {
-        apply_init_swarm(&mut staged, init_req)?;
+        apply_init_swarm(&mut staged, kzg, init_req)?;
     }
     let mut receipts = Vec::with_capacity(txs.len());
     for tx_dto in txs {
@@ -335,6 +339,8 @@ async fn propose_and_finalize_distributed(
         own_prevote,
         own_precommit,
         expected_height,
+        staged,
+        receipts,
     ) = {
         let guard = state.lock().await;
         let (staged, receipts) = execute_stage(
@@ -367,6 +373,8 @@ async fn propose_and_finalize_distributed(
             pv,
             pc,
             next_height,
+            staged,
+            receipts,
         )
     };
 
@@ -405,13 +413,6 @@ async fn propose_and_finalize_distributed(
         guard
             .bft
             .verify_quorum(&precommits, expected_height, &block_hash, VotePhase::Precommit)?;
-        let (staged, receipts) = execute_stage(
-            &guard.exec,
-            &guard.kzg,
-            &guard.epoch_seed,
-            &init_swarms,
-            &txs,
-        )?;
         guard.exec = staged;
         guard.bft.height = expected_height;
         guard.bft.last_block_hash = block_hash;

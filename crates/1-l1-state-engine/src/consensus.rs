@@ -126,23 +126,35 @@ pub fn vote_signing_bytes(
 }
 
 /// Executor의 결정론적 상태 커밋먼트(State Root) 계산
+///
+/// 스웜이 초기화된 이후에는 오직 온체인 합의 상태 경계인 148B `VirtualSwarmState` 헤더만 해시한다.
+/// 스웜 편성 전 제네시스 노드 등록 블록(`swarms.is_empty()`)에서는 등록 풀 상태를 결정론적으로 커밋한다.
 pub fn compute_state_root(executor: &Executor) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(b"depin/state-root/v1");
-    for (swarm_id, sw) in &executor.db.swarms {
-        h.update(swarm_id.to_le_bytes());
-        h.update(sw.member_verkle_root);
-        h.update(sw.active_blobs_root);
-        h.update(sw.total_bond_balance.to_le_bytes());
-        h.update(sw.storage_bounty_pool.to_le_bytes());
-        h.update(sw.last_epoch_settled.to_le_bytes());
-    }
-    for (pk, acc) in &executor.db.nodes {
-        h.update(pk);
-        h.update(acc.stake.to_le_bytes());
-        h.update(acc.reward_balance.to_le_bytes());
-        h.update(acc.consecutive_offline_epochs.to_le_bytes());
-        h.update([u8::from(acc.slashed)]);
+    if executor.db.swarms.is_empty() {
+        h.update([0u8]);
+        h.update((executor.db.nodes.len() as u64).to_le_bytes());
+        h.update((executor.db.standby_pool.len() as u64).to_le_bytes());
+        for (pk, acc) in &executor.db.nodes {
+            h.update(pk);
+            h.update(acc.stake.to_le_bytes());
+            h.update(acc.reward_balance.to_le_bytes());
+            h.update(acc.consecutive_offline_epochs.to_le_bytes());
+            h.update([u8::from(acc.slashed)]);
+        }
+    } else {
+        h.update([1u8]);
+        for sw in executor.db.swarms.values() {
+            h.update(sw.swarm_id.to_le_bytes());
+            h.update(sw.member_verkle_root);
+            h.update(sw.active_blobs_root);
+            h.update(sw.total_bond_balance.to_le_bytes());
+            h.update(sw.storage_bounty_pool.to_le_bytes());
+            h.update(sw.last_epoch_settled.to_le_bytes());
+            h.update(sw.min_threshold_k.to_le_bytes());
+            h.update(sw.lazy_repair_trigger.to_le_bytes());
+        }
     }
     h.finalize().into()
 }
@@ -389,5 +401,55 @@ mod tests {
             bft.verify_quorum(&[malformed], 1, &hash, VotePhase::Prevote),
             Err(Error::BadSignature)
         ));
+    }
+
+    #[test]
+    fn state_root_hashes_only_onchain_swarm_headers_once_swarms_exist() {
+        use crate::executor::sign_registration;
+        use crate::state_db::{compute_member_verkle_root, SWARM_SIZE};
+
+        let mut exec = Executor::new(ExecutorConfig::default());
+        let kzg = Kzg::setup(SWARM_SIZE - 1, &mut OsRng);
+        let seed = [0x11u8; 32];
+
+        // 1. 스웜 초기화 전에는 등록 풀(nodes/standby_pool) 변화에 따라 state_root가 결정론적으로 갱신된다.
+        let empty_root = compute_state_root(&exec);
+        let mut roster = Vec::with_capacity(SWARM_SIZE);
+        for i in 0..SWARM_SIZE {
+            let sk = SigningKey::random(&mut OsRng);
+            let (pk, sig) = sign_registration(&sk, exec.config.chain_id, i as u16, 1, 2_000);
+            exec.execute(
+                NativeTransaction::RegisterMobileNode {
+                    pubkey_p256: pk,
+                    hw_attestation_sig: sig,
+                    ip_subnet_hash: i as u16,
+                    country_code: 1,
+                    stake: 2_000,
+                },
+                &kzg,
+                &seed,
+            )
+            .unwrap();
+            roster.push(pk);
+        }
+        let pre_swarm_root = compute_state_root(&exec);
+        assert_ne!(empty_root, pre_swarm_root);
+
+        // 2. 스웜 초기화 후에는 오직 148B VirtualSwarmState 헤더만 state_root에 반영된다.
+        let member_root = compute_member_verkle_root(&kzg, &roster).unwrap();
+        exec.init_swarm(0, roster.clone(), member_root, [0x22u8; 48], 5_000)
+            .unwrap();
+        let swarm_root = compute_state_root(&exec);
+
+        // 오프체인 보조 인덱스(nodes 보상/오프라인 카운터, standby_pool, swarm_rosters) 변경은 state_root에 불변
+        exec.db.nodes.get_mut(&roster[0]).unwrap().reward_balance += 777;
+        exec.db.nodes.get_mut(&roster[1]).unwrap().consecutive_offline_epochs = 2;
+        exec.db.standby_pool.push([0xAAu8; 33]);
+        exec.db.swarm_rosters.get_mut(&0).unwrap()[0] = [0xBBu8; 33];
+        assert_eq!(compute_state_root(&exec), swarm_root);
+
+        // 반면 온체인 148B VirtualSwarmState 헤더의 어느 필드든 바뀌면 state_root가 변경된다.
+        exec.db.swarms.get_mut(&0).unwrap().lazy_repair_trigger += 1;
+        assert_ne!(compute_state_root(&exec), swarm_root);
     }
 }
