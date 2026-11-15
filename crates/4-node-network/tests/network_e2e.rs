@@ -125,8 +125,15 @@ fn distributed_bft_lazy_repair_crash_recovery_and_download_e2e() {
                 .expect("status on follower validator");
         assert_eq!(status_after_reg.registered_nodes, SWARM_SIZE);
         assert_eq!(status_after_reg.height, 10);
+        assert_eq!(status_after_reg.swarm_count, 1);
+        let expected_roster: Vec<String> = cluster_map
+            .slots
+            .iter()
+            .map(|s| s.pubkey_hex.clone())
+            .collect();
+        assert_eq!(status_after_reg.swarms[0].roster_pubkeys_hex, expected_roster);
 
-        // 2. 원본 파일 인코딩, 스웜 초기화, 100조각 실제 TCP P2P 분산 업로드
+        // 2. 원본 파일 인코딩, Zero-Tx 라우팅(+바운티 예치), 100조각 실제 TCP P2P 분산 업로드
         let kzg = ValidatorStorage::load_or_create_kzg(
             &tmp.path.join("client_kzg"),
             SWARM_SIZE - 1,
@@ -144,6 +151,7 @@ fn distributed_bft_lazy_repair_crash_recovery_and_download_e2e() {
         )
         .await
         .expect("upload payload");
+        let init_block = init_block.expect("bounty deposit block");
         assert_eq!(init_block.header.height, 11);
 
         // 디스크 영속화 검증
@@ -602,6 +610,209 @@ fn p2p_heartbeat_receipt_fault_proof_and_custodian_handoff_e2e() {
         ));
 
         standby.shutdown().await;
+        for v in validators {
+            v.shutdown().await;
+        }
+        for s in storage_nodes {
+            s.shutdown().await;
+        }
+    });
+}
+
+#[test]
+fn auto_shuffle_zero_tx_routing_and_multifile_upload_download_e2e() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+
+    rt.block_on(async {
+        let tmp = TempDirGuard::new("network_multifile_e2e");
+
+        let validator_seeds: Vec<(u64, u64)> = (0..4).map(|id| (id, 900 + id)).collect();
+        let val_p2p: Vec<SocketAddr> = (0..4).map(|_| reserve_addr()).collect();
+        let val_rpc: Vec<SocketAddr> = (0..4).map(|_| reserve_addr()).collect();
+
+        let mut validators = Vec::new();
+        for id in 0..4usize {
+            let peers: Vec<SocketAddr> = val_p2p
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != id)
+                .map(|(_, addr)| *addr)
+                .collect();
+            let handle = start_validator_daemon(ValidatorDaemonConfig {
+                validator_id: id as u64,
+                p2p_addr: val_p2p[id],
+                rpc_addr: val_rpc[id],
+                peer_p2p_addrs: peers,
+                validator_seeds: validator_seeds.clone(),
+                data_dir: tmp.path.join(format!("validator_{id}")),
+                epoch_seed: DEFAULT_EPOCH_SEED,
+                kzg_seed: DEFAULT_KZG_SEED,
+            })
+            .await
+            .expect("start validator");
+            validators.push(handle);
+        }
+
+        let node_endpoints: Vec<(u64, SocketAddr, SocketAddr)> = (0..10u64)
+            .map(|id| (id, reserve_addr(), reserve_addr()))
+            .collect();
+        let cluster_map =
+            build_cluster_map(0, 2602, &node_endpoints).expect("build cluster map");
+
+        let mut storage_nodes = Vec::new();
+        for (node_id, p2p_addr, rpc_addr) in &node_endpoints {
+            let slots = slots_for_node(&cluster_map, *node_id);
+            let handle = start_storage_daemon(StorageDaemonConfig {
+                node_id: *node_id,
+                slots,
+                swarm_id: 0,
+                p2p_addr: *p2p_addr,
+                rpc_addr: *rpc_addr,
+                l1_rpc_url: validators[0].rpc_url.clone(),
+                cluster_map: cluster_map.clone(),
+                data_dir: tmp.path.join(format!("storage_{node_id}")),
+                trigger: 45,
+                target: 60,
+                kzg_seed: DEFAULT_KZG_SEED,
+            })
+            .await
+            .expect("start storage node");
+            storage_nodes.push(handle);
+        }
+
+        // 1. 노드 등록 완료 시 L1 셔플러가 자동으로 Swarm #0을 편성하고 키 순서가 cluster_map과 정확히 일치
+        let reg_count = register_cluster_via_nodes(&cluster_map)
+            .await
+            .expect("register all nodes");
+        assert_eq!(reg_count, SWARM_SIZE);
+
+        let status: L1StatusDto =
+            http_request_json::<(), L1StatusDto>(&validators[1].rpc_url, "GET", "/status", None)
+                .await
+                .expect("status");
+        assert_eq!(status.swarm_count, 1);
+        assert_eq!(status.swarms[0].swarm_id, 0);
+        assert_eq!(status.swarms[0].state.active_blobs_root, [0u8; 48]);
+        let expected_roster: Vec<String> = cluster_map
+            .slots
+            .iter()
+            .map(|s| s.pubkey_hex.clone())
+            .collect();
+        assert_eq!(status.swarms[0].roster_pubkeys_hex, expected_roster);
+        assert_eq!(status.height, 10);
+
+        // 2. bounty=0으로 서로 다른 2개 파일을 Zero-Tx P2P 업로드 (온체인 블록 높이 증가 없음)
+        let kzg = ValidatorStorage::load_or_create_kzg(
+            &tmp.path.join("client_kzg"),
+            SWARM_SIZE - 1,
+            DEFAULT_KZG_SEED,
+        )
+        .expect("client kzg");
+        let payload_a: Vec<u8> = (0..8_192).map(|i| ((i * 17 + 3) % 251) as u8).collect();
+        let payload_b: Vec<u8> = (0..10_500).map(|i| ((i * 31 + 11) % 247) as u8).collect();
+
+        let (manifest_a, block_a) = upload_payload(
+            &validators[0].rpc_url,
+            &cluster_map,
+            &kzg,
+            &payload_a,
+            0,
+            101,
+        )
+        .await
+        .expect("upload file A");
+        assert!(block_a.is_none());
+        assert_eq!(manifest_a.swarm_id, 0);
+
+        let (manifest_b, block_b) = upload_payload(
+            &validators[0].rpc_url,
+            &cluster_map,
+            &kzg,
+            &payload_b,
+            0,
+            202,
+        )
+        .await
+        .expect("upload file B");
+        assert!(block_b.is_none());
+        assert_eq!(manifest_b.swarm_id, 0);
+        assert_ne!(manifest_a.object_id_hex, manifest_b.object_id_hex);
+
+        let status_after_uploads: L1StatusDto =
+            http_request_json::<(), L1StatusDto>(&validators[0].rpc_url, "GET", "/status", None)
+                .await
+                .expect("status after zero-tx uploads");
+        assert_eq!(status_after_uploads.height, 10);
+
+        // 3. 두 번째 파일 업로드 후에도 파일 A와 파일 B 모두 개별 매니페스트 조회로 100% 복원
+        let (decoded_a, count_a) = download_payload(
+            &cluster_map,
+            &manifest_a.object_id_hex,
+            Some(&storage_nodes[0].rpc_url),
+        )
+        .await
+        .expect("download file A");
+        assert!(count_a >= 30);
+        assert_eq!(decoded_a, payload_a);
+
+        let (decoded_b, count_b) = download_payload(
+            &cluster_map,
+            &manifest_b.object_id_hex,
+            Some(&storage_nodes[0].rpc_url),
+        )
+        .await
+        .expect("download file B");
+        assert!(count_b >= 30);
+        assert_eq!(decoded_b, payload_b);
+
+        // 4. 6대 다운 후 Zero-Tx 초기 루트([0u8; 48])에서 지연 복구 체크포인트 전이 검증
+        for _ in 0..6 {
+            let h = storage_nodes.remove(0);
+            h.shutdown().await;
+        }
+        let report: CycleReportDto = http_request_json(
+            &storage_nodes[0].rpc_url,
+            "POST",
+            "/aggregator/run_cycle",
+            Some(&RunCycleReq { epoch: 1 }),
+        )
+        .await
+        .expect("run aggregator cycle from zero root");
+        assert_eq!(report.aggregator_slot, 60);
+        assert_eq!(report.repaired_slots.len(), 20);
+        assert_eq!(report.block_height, 11);
+        assert_eq!(report.aggregator_bonus, 50);
+
+        let status_after_cycle: L1StatusDto =
+            http_request_json::<(), L1StatusDto>(&validators[0].rpc_url, "GET", "/status", None)
+                .await
+                .expect("status after cycle");
+        assert_eq!(
+            hex::encode(status_after_cycle.swarms[0].state.active_blobs_root),
+            report.new_blobs_root_hex
+        );
+
+        let (decoded_a_after, _) = download_payload(
+            &cluster_map,
+            &manifest_a.object_id_hex,
+            Some(&storage_nodes[0].rpc_url),
+        )
+        .await
+        .expect("download file A after node loss");
+        assert_eq!(decoded_a_after, payload_a);
+
+        let (decoded_b_after, _) = download_payload(
+            &cluster_map,
+            &manifest_b.object_id_hex,
+            Some(&storage_nodes[0].rpc_url),
+        )
+        .await
+        .expect("download file B after repair");
+        assert_eq!(decoded_b_after, payload_b);
+
         for v in validators {
             v.shutdown().await;
         }

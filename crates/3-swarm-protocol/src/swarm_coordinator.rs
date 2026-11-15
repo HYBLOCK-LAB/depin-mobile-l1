@@ -111,6 +111,9 @@ pub fn build_checkpoint_with_bitmap(
         if old_proofs.len() != SWARM_SIZE {
             return Err(Error::Invalid);
         }
+        let old_blobs_root = kzg
+            .commit(old_fingerprints)
+            .map_err(|_| Error::CoordinatorFailed)?;
         let entry_index =
             expected_repair_audit_index(epoch_seed, swarm_id, epoch, repair_log.len());
         let entry = &repair_log[entry_index];
@@ -132,6 +135,7 @@ pub fn build_checkpoint_with_bitmap(
 
         Some(RepairAuditProof {
             entry_index,
+            old_blobs_root,
             parent_a_eval: scalar_to_bytes(&old_fingerprints[pa]),
             parent_a_proof: old_proofs[pa],
             parent_b_eval: scalar_to_bytes(&old_fingerprints[pb]),

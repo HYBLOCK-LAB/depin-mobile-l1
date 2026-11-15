@@ -9,6 +9,6 @@
 cluster_map.json
 recovered.bin
 sample.bin
-data_dir
+/data_dir
 /validator_*
 /storage_*

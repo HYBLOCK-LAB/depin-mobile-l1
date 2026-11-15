@@ -138,9 +138,16 @@ fn execute_stage(
         apply_init_swarm(&mut staged, kzg, init_req)?;
     }
     let mut receipts = Vec::with_capacity(txs.len());
+    let mut had_registration = false;
     for tx_dto in txs {
         let native: NativeTransaction = tx_dto.to_native()?;
+        if matches!(native, NativeTransaction::RegisterMobileNode { .. }) {
+            had_registration = true;
+        }
         receipts.push(staged.execute(native, kzg, epoch_seed)?);
+    }
+    if had_registration && staged.db.standby_pool.len() >= SWARM_SIZE {
+        staged.auto_shuffle_standby_swarms(kzg, epoch_seed, 10_000)?;
     }
     Ok((staged, receipts))
 }

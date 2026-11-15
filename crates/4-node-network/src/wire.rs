@@ -117,6 +117,8 @@ impl TryFrom<&RepairEntryDto> for RepairEntry {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RepairAuditProofDto {
     pub entry_index: usize,
+    #[serde(default)]
+    pub old_blobs_root_hex: String,
     pub parent_a_eval_hex: String,
     pub parent_a_proof_hex: String,
     pub parent_b_eval_hex: String,
@@ -133,6 +135,7 @@ impl From<&RepairAuditProof> for RepairAuditProofDto {
     fn from(p: &RepairAuditProof) -> Self {
         Self {
             entry_index: p.entry_index,
+            old_blobs_root_hex: hex::encode(p.old_blobs_root),
             parent_a_eval_hex: hex::encode(p.parent_a_eval),
             parent_a_proof_hex: hex::encode(p.parent_a_proof),
             parent_b_eval_hex: hex::encode(p.parent_b_eval),
@@ -150,8 +153,14 @@ impl From<&RepairAuditProof> for RepairAuditProofDto {
 impl TryFrom<&RepairAuditProofDto> for RepairAuditProof {
     type Error = Error;
     fn try_from(d: &RepairAuditProofDto) -> Result<Self> {
+        let old_blobs_root = if d.old_blobs_root_hex.is_empty() {
+            [0u8; 48]
+        } else {
+            decode_fixed_hex::<48>(&d.old_blobs_root_hex)?
+        };
         Ok(Self {
             entry_index: d.entry_index,
+            old_blobs_root,
             parent_a_eval: decode_fixed_hex::<32>(&d.parent_a_eval_hex)?,
             parent_a_proof: decode_fixed_hex::<48>(&d.parent_a_proof_hex)?,
             parent_b_eval: decode_fixed_hex::<32>(&d.parent_b_eval_hex)?,
@@ -910,6 +919,7 @@ mod tests {
                 kzg_sample_proof: [0x55; 48],
                 repair_audit: Some(RepairAuditProof {
                     entry_index: 0,
+                    old_blobs_root: [0x12; 48],
                     parent_a_eval: [0x66; 32],
                     parent_a_proof: [0x77; 48],
                     parent_b_eval: [0x88; 32],

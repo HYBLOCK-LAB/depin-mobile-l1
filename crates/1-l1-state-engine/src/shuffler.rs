@@ -34,7 +34,7 @@ pub struct ShuffleOutput {
     pub standby_pool: Vec<[u8; 33]>,
 }
 
-fn score_node(pubkey: &[u8; 33], epoch_seed: &[u8; 32]) -> [u8; 32] {
+pub fn score_node(pubkey: &[u8; 33], epoch_seed: &[u8; 32]) -> [u8; 32] {
     let mut h = Keccak256::new();
     h.update(pubkey);
     h.update(epoch_seed);
