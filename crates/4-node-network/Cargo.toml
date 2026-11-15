@@ -1,0 +1,19 @@
+[package]
+name = "node-network"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hex.workspace = true
+l1-state-engine = { path = "../1-l1-state-engine" }
+p256.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+swarm-protocol = { path = "../3-swarm-protocol" }
+thiserror.workspace = true
+tokio.workspace = true
+verkle-fountain = { path = "../2-verkle-fountain" }

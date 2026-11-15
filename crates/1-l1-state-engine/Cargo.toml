@@ -1,0 +1,14 @@
+[package]
+name = "l1-state-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+p256.workspace = true
+rand.workspace = true
+serde.workspace = true
+sha2.workspace = true
+sha3.workspace = true
+thiserror.workspace = true
+verkle-fountain = { path = "../2-verkle-fountain" }

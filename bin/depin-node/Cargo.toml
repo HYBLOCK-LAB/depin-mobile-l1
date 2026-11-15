@@ -1,0 +1,11 @@
+[package]
+name = "depin-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+clap.workspace = true
+node-network = { path = "../../crates/4-node-network" }
+serde_json.workspace = true
+tokio.workspace = true

@@ -1,0 +1,14 @@
+/target
+.serena
+*.tmp
+*.log
+.DS_Store
+
+# Test & runtime artifacts
+/kzg_cache
+cluster_map.json
+recovered.bin
+sample.bin
+data_dir
+validator_*
+storage_*

@@ -1,0 +1,6 @@
+method,hourly_churn,trigger,seed,repair_read_bytes,repair_write_bytes,onchain_tx,available_steps,total_steps,survived,final_active,initial_storage_bytes
+proposed_fp_lazy,0.25,35,42,0,0,4,144,144,true,51,333333400
+proposed_fp_lazy,0.25,40,42,0,0,4,144,144,true,51,333333400
+proposed_fp_lazy,0.25,45,42,0,0,4,144,144,true,51,333333400
+proposed_fp_lazy,0.25,50,42,66666680,33333340,4,144,144,true,60,333333400
+proposed_fp_lazy,0.25,55,42,46666676,23333338,4,144,144,true,57,333333400

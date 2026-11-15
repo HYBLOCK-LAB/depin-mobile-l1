@@ -1,0 +1,17 @@
+[package]
+name = "node-benchmark"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ark-ff.workspace = true
+csv.workspace = true
+l1-state-engine = { path = "../../crates/1-l1-state-engine" }
+p256.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+serde.workspace = true
+sha2.workspace = true
+swarm-protocol = { path = "../../crates/3-swarm-protocol" }
+verkle-fountain = { path = "../../crates/2-verkle-fountain" }

@@ -1,0 +1,16 @@
+[package]
+name = "swarm-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+csv.workspace = true
+l1-state-engine = { path = "../1-l1-state-engine" }
+p256.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+serde.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+verkle-fountain = { path = "../2-verkle-fountain" }

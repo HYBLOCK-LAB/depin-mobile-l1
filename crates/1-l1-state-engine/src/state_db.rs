@@ -1,0 +1,355 @@
+use crate::Result;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+
+mod bytes48 {
+    use super::*;
+    pub fn serialize<S: Serializer>(v: &[u8; 48], s: S) -> std::result::Result<S::Ok, S::Error> {
+        v.as_slice().serialize(s)
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<[u8; 48], D::Error> {
+        let vec = Vec::<u8>::deserialize(d)?;
+        vec.try_into()
+            .map_err(|v: Vec<u8>| serde::de::Error::invalid_length(v.len(), &"48 bytes"))
+    }
+}
+
+pub const SWARM_SIZE: usize = 100;
+
+/// L1 글로벌 상태 DB에 저장되는 가상 스웜 추상화 상태 객체 (고정 크기 148 Bytes)
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VirtualSwarmState {
+    pub swarm_id: u64,
+    #[serde(with = "bytes48")]
+    pub member_verkle_root: [u8; 48],  // 100대 모바일 노드 공개키(P-256) 및 지분 KZG 루트
+    #[serde(with = "bytes48")]
+    pub active_blobs_root: [u8; 48],   // 보관 중인 파일 조각들의 KZG 루트
+    pub total_bond_balance: u128,      // 스웜 공동 스테이킹 담보금
+    pub storage_bounty_pool: u128,     // 유저들이 예치한 보관 보상금(Bounty) 풀
+    pub last_epoch_settled: u64,       // 마지막 정산 에포크 번호
+    pub min_threshold_k: u16,          // 최소 복구 조각 수 (30)
+    pub lazy_repair_trigger: u16,      // 지연 복구 발동 임계선 T_repair (45)
+}
+
+impl VirtualSwarmState {
+    /// 직렬화된 고정 바이너리 크기 (Bytes)
+    pub const fn encoded_bytes_len() -> usize {
+        8 + 48 + 48 + 16 + 16 + 8 + 2 + 2 // = 148 Bytes
+    }
+}
+
+/// 지연 복구 발생 시 L1에 보고되는 복구 계보 엔트리 (35 Bytes)
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepairEntry {
+    pub repaired_slot: u8,
+    pub parent_slot_a: u8,
+    pub parent_slot_b: u8,
+    /// S_new = S_A + factor_b * S_B (mod p) 결합 계수
+    pub factor_b: [u8; 32],
+}
+
+/// L1 VRF가 랜덤 지목한 복구 슬롯 1건에 대한 O(1) KZG 동형 감사 증명 패키지
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepairAuditProof {
+    pub entry_index: usize,
+    pub parent_a_eval: [u8; 32],
+    pub parent_a_proof: [u8; 48],
+    pub parent_b_eval: [u8; 32],
+    pub parent_b_proof: [u8; 48],
+    pub repaired_eval: [u8; 32],
+    pub repaired_proof: [u8; 48],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NativeTransaction {
+    RegisterMobileNode {
+        pubkey_p256: [u8; 33],
+        hw_attestation_sig: [u8; 64],
+        ip_subnet_hash: u16,
+        country_code: u8,
+        stake: u128,
+    },
+    DepositStorageBounty {
+        swarm_id: u64,
+        amount: u128,
+    },
+    /// 6시간 에포크마다 스웜 어그리게이터(0번 슬롯 우선, 부재 시 차순위 승계)가 제출하는 체크포인트
+    SubmitSwarmCheckpoint {
+        swarm_id: u64,
+        epoch: u64,
+        aggregator_slot: u8,           // 제출자 슬롯 번호 (에포크 보상의 5% 보너스 수령)
+        new_blobs_root: [u8; 48],      // 현재 스웜이 보관·복구 유지 중인 파일 조각들의 48B KZG 루트
+        repair_log: Vec<RepairEntry>,  // 지연 복구 발생 시 기록되는 복구 계보 (평상시 빈 배열)
+        uptime_bitmap: u128,           // 100대 노드 가동 출석부 비트맵 (1 bit = 1 node)
+        sample_index: u8,              // L1 VRF가 랜덤 지목한 감사 대상 조각 인덱스 (0..99)
+        sample_eval: [u8; 32],         // 해당 조각의 32B 지문(다항식 평가값)
+        kzg_sample_proof: [u8; 48],    // 48B KZG 몫 다항식 인수정리 증명
+        repair_audit: Option<RepairAuditProof>,
+        aggregator_p256_sig: [u8; 64], // 스웜 어그리게이터의 TEE(P-256) 서명
+    },
+    /// 반장이 켜져 있던 노드를 결석(0)으로 허위 보고했을 때 피해 노드가 제출하는 반박 증거 (Fault Proof)
+    SubmitHeartbeatFaultProof {
+        swarm_id: u64,
+        epoch: u64,
+        node_slot: u8,
+        aggregator_slot: u8,
+        signed_pong_receipt: [u8; 64], // 에포크 내 반장이 서명해 준 생존 확인 영수증
+    },
+}
+
+impl NativeTransaction {
+    /// P-256 서명 및 검증용 결정론적 체크포인트 바이트 직렬화
+    pub fn checkpoint_signing_bytes(
+        swarm_id: u64,
+        epoch: u64,
+        aggregator_slot: u8,
+        new_blobs_root: &[u8; 48],
+        repair_log: &[RepairEntry],
+        uptime_bitmap: u128,
+        sample_index: u8,
+        sample_eval: &[u8; 32],
+    ) -> Vec<u8> {
+        let mut h = Sha256::new();
+        h.update(b"depin/checkpoint/v1");
+        h.update(swarm_id.to_le_bytes());
+        h.update(epoch.to_le_bytes());
+        h.update([aggregator_slot]);
+        h.update(new_blobs_root);
+        h.update((repair_log.len() as u64).to_le_bytes());
+        for entry in repair_log {
+            h.update([entry.repaired_slot, entry.parent_slot_a, entry.parent_slot_b]);
+            h.update(entry.factor_b);
+        }
+        h.update(uptime_bitmap.to_le_bytes());
+        h.update([sample_index]);
+        h.update(sample_eval);
+        h.finalize().to_vec()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeAccount {
+    pub pubkey_p256: [u8; 33],
+    pub ip_subnet_hash: u16,
+    pub country_code: u8,
+    pub stake: u128,
+    pub reward_balance: u128,
+    pub consecutive_offline_epochs: u32,
+    pub slashed: bool,
+}
+
+/// [비교 Baseline] 100대 노드의 개별 주소·슬롯·상태를 온체인에 각각 기록하는 레거시 상태 DB
+#[derive(Default, Clone, Debug)]
+pub struct LegacyStateDB {
+    /// (blob_id, slot_index) -> LegacySlotRecord
+    pub shard_owners: BTreeMap<(u64, u8), LegacySlotRecord>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LegacySlotRecord {
+    pub node_pubkey: [u8; 33],
+    pub shard_hash: [u8; 32],
+    pub reward_balance: u128,
+    pub last_active_epoch: u64,
+}
+
+impl LegacySlotRecord {
+    pub const fn encoded_bytes_len() -> usize {
+        33 + 32 + 16 + 8 // = 89 Bytes per node slot (100 nodes = 8,900 Bytes)
+    }
+}
+
+impl LegacyStateDB {
+    pub fn insert_blob_slots(&mut self, blob_id: u64, owners: &[[u8; 33]]) {
+        for (i, pk) in owners.iter().enumerate() {
+            self.shard_owners.insert(
+                (blob_id, i as u8),
+                LegacySlotRecord {
+                    node_pubkey: *pk,
+                    shard_hash: [0u8; 32],
+                    reward_balance: 0,
+                    last_active_epoch: 0,
+                },
+            );
+        }
+    }
+
+    pub fn update_slot_owner(&mut self, blob_id: u64, slot: u8, new_owner: [u8; 33], epoch: u64) {
+        if let Some(rec) = self.shard_owners.get_mut(&(blob_id, slot)) {
+            rec.node_pubkey = new_owner;
+            rec.last_active_epoch = epoch;
+        }
+    }
+
+    /// 온체인 상태 트리에 보관 중인 레거시 메타데이터 총 크기 (Bytes)
+    pub fn total_state_bytes(&self) -> usize {
+        self.shard_owners.len() * LegacySlotRecord::encoded_bytes_len()
+    }
+}
+
+/// [제안 구조] 가상 스웜 단위로 48B Verkle Root만 L1 상태에 저장하는 네이티브 DB
+#[derive(Default, Clone, Debug)]
+pub struct EnshrinedSwarmDB {
+    pub swarms: BTreeMap<u64, VirtualSwarmState>,
+    pub swarm_rosters: BTreeMap<u64, Vec<[u8; 33]>>,
+    pub nodes: BTreeMap<[u8; 33], NodeAccount>,
+    pub standby_pool: Vec<[u8; 33]>,
+}
+
+impl EnshrinedSwarmDB {
+    /// 스웜 온체인 상태 메타데이터 총 크기 (Bytes)
+    pub fn swarm_headers_bytes(&self) -> usize {
+        self.swarms.len() * VirtualSwarmState::encoded_bytes_len()
+    }
+
+    pub fn get_swarm(&self, swarm_id: u64) -> Result<&VirtualSwarmState> {
+        self.swarms
+            .get(&swarm_id)
+            .ok_or(crate::Error::InvalidInput)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_vs_enshrined_state_size_compression() {
+        assert_eq!(LegacySlotRecord::encoded_bytes_len(), 89);
+        assert_eq!(VirtualSwarmState::encoded_bytes_len(), 148);
+
+        let owners: Vec<[u8; 33]> = (0..SWARM_SIZE)
+            .map(|i| {
+                let mut pk = [0u8; 33];
+                pk[0] = 0x02;
+                pk[1] = i as u8;
+                pk
+            })
+            .collect();
+
+        let mut legacy = LegacyStateDB::default();
+        legacy.insert_blob_slots(7, &owners);
+        assert_eq!(legacy.total_state_bytes(), 8_900);
+
+        let replacement = [0xAAu8; 33];
+        legacy.update_slot_owner(7, 42, replacement, 5);
+        let updated = &legacy.shard_owners[&(7, 42)];
+        assert_eq!(updated.node_pubkey, replacement);
+        assert_eq!(updated.last_active_epoch, 5);
+
+        let mut enshrined = EnshrinedSwarmDB::default();
+        enshrined.swarms.insert(
+            7,
+            VirtualSwarmState {
+                swarm_id: 7,
+                member_verkle_root: [1u8; 48],
+                active_blobs_root: [2u8; 48],
+                total_bond_balance: 100_000,
+                storage_bounty_pool: 5_000,
+                last_epoch_settled: 0,
+                min_threshold_k: 30,
+                lazy_repair_trigger: 45,
+            },
+        );
+        assert_eq!(enshrined.swarm_headers_bytes(), 148);
+        assert!(enshrined.get_swarm(7).is_ok());
+        assert!(matches!(
+            enshrined.get_swarm(999),
+            Err(crate::Error::InvalidInput)
+        ));
+    }
+
+    #[test]
+    fn checkpoint_signing_bytes_is_deterministic_and_sensitive_to_fields() {
+        let root = [0x11u8; 48];
+        let eval = [0x22u8; 32];
+        let entry = RepairEntry {
+            repaired_slot: 3,
+            parent_slot_a: 10,
+            parent_slot_b: 20,
+            factor_b: [0x33u8; 32],
+        };
+
+        let base = NativeTransaction::checkpoint_signing_bytes(
+            1,
+            2,
+            0,
+            &root,
+            std::slice::from_ref(&entry),
+            0b1011,
+            7,
+            &eval,
+        );
+        let repeat = NativeTransaction::checkpoint_signing_bytes(
+            1,
+            2,
+            0,
+            &root,
+            std::slice::from_ref(&entry),
+            0b1011,
+            7,
+            &eval,
+        );
+        assert_eq!(base, repeat);
+
+        assert_ne!(
+            base,
+            NativeTransaction::checkpoint_signing_bytes(
+                1,
+                3,
+                0,
+                &root,
+                std::slice::from_ref(&entry),
+                0b1011,
+                7,
+                &eval,
+            )
+        );
+        assert_ne!(
+            base,
+            NativeTransaction::checkpoint_signing_bytes(
+                1,
+                2,
+                1,
+                &root,
+                std::slice::from_ref(&entry),
+                0b1011,
+                7,
+                &eval,
+            )
+        );
+        assert_ne!(
+            base,
+            NativeTransaction::checkpoint_signing_bytes(
+                1,
+                2,
+                0,
+                &root,
+                std::slice::from_ref(&entry),
+                0b1111,
+                7,
+                &eval,
+            )
+        );
+        assert_ne!(
+            base,
+            NativeTransaction::checkpoint_signing_bytes(1, 2, 0, &root, &[], 0b1011, 7, &eval)
+        );
+        let mut alt_eval = eval;
+        alt_eval[0] ^= 1;
+        assert_ne!(
+            base,
+            NativeTransaction::checkpoint_signing_bytes(
+                1,
+                2,
+                0,
+                &root,
+                std::slice::from_ref(&entry),
+                0b1011,
+                7,
+                &alt_eval,
+            )
+        );
+    }
+}

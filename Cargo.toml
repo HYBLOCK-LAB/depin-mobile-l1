@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/1-l1-state-engine",
+    "crates/2-verkle-fountain",
+    "crates/3-swarm-protocol",
+    "crates/4-node-network",
+    "bin/node-benchmark",
+    "bin/depin-node",
+    "bin/depin-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+ark-bls12-381 = "0.5.0"
+ark-ec = "0.5.0"
+ark-ff = "0.5.0"
+ark-poly = "0.5.0"
+ark-serialize = "0.5.0"
+ark-std = "0.5.0"
+p256 = { version = "0.13.2", features = ["ecdsa"] }
+sha2 = "0.10"
+sha3 = "0.10"
+rand = "0.8"
+rand_chacha = "0.3"
+thiserror = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.53", features = ["rt-multi-thread", "net", "io-util", "time", "sync"] }
+clap = { version = "4.6", features = ["derive"] }
+csv = "1.4"
+hex = "0.4"
