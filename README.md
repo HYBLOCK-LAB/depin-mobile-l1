@@ -18,7 +18,7 @@
   - 타원곡선 점 덧셈 기반 $O(1)$ 비잔틴 오염 조각 색출기 (`verify_homomorphic_repair`, 3.6ms)
 - **`crates/3-swarm-protocol`**:
   - 안전버퍼($T_{\text{repair}}=45$) 지연 복구 상태 머신 (`generation` 가드 및 생존 노드 임시 보관)
-  - 0번 $\rightarrow$ 1번 $\rightarrow$ 2번 반장 순번 자동 승계 및 단일 체크포인트 트랜잭션 조립기
+  - 0번 → 1번 → 2번 반장 순번 자동 승계 및 단일 체크포인트 트랜잭션 조립기
   - Paired RNG 기반 24시간 이산 사건 Churn 시뮬레이터 및 임계값 스윕
 - **`crates/4-node-network`**:
   - 4바이트 길이 접두어 TCP P2P 프로토콜 (`Ping`, `StoreShard`, `FetchShard`, `BftPropose`, `BftCommit`)

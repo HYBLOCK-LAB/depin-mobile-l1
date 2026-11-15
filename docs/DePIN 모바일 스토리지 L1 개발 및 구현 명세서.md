@@ -159,7 +159,7 @@ pub enum NativeTransaction {
 1. **`state_db.rs`**: 100대 노드를 개별 슬롯(`LegacySlotRecord` 89B × 100 = `8,900 Bytes`)에 저장하는 `LegacyStateDB`와 단일 `VirtualSwarmState`(`148 Bytes`, **98.3% 절감**)로 압축 저장하는 `EnshrinedSwarmDB` 구현.
 2. **`shuffler.rs` (스웜 편성 및 파일별 결정론적 자동 라우팅)**:
    - **스웜 풀 편성:** 에포크 블록 헤더의 VRF 난수($R_{\text{epoch}}$)를 입력받아 $\text{Keccak256}(\text{NodeID} \parallel R_{\text{epoch}})$ 순으로 노드를 정렬하고, 다양성 제약(동일 IP 서브넷 $\le 2$대, 동일 국가 코드 $\le 25$대)을 적용해 $N$개의 가상 스웜(`Swarm #0 ~ #N-1`)을 편성.
-   - **파일별 스웜 자동 배정:** `route_file_to_swarm`이 $\text{Target\_Swarm} = \text{Keccak256}(\text{File\_ID} \parallel R_{\text{epoch}}) \pmod N$ 공식으로 온체인 Tx 없이 담당 스웜을 결정론적으로 라우팅.
+   - **파일별 스웜 자동 배정:** `route_file_to_swarm`이 $\text{TargetSwarm} = \text{Keccak256}(\text{FileID} \parallel R_{\text{epoch}}) \pmod N$ 공식으로 온체인 Tx 없이 담당 스웜을 결정론적으로 라우팅.
 3. **`executor.rs` (보유·복구 증명 검증, 반장 인센티브 및 출석 반박 슬래싱)**:
    - **반장 순번 승계 및 보너스(5%):** 0번 슬롯 노드가 기본 어그리게이터이나, 오프라인일 경우 차순위(1번, 2번...) 온라인 노드가 제출하고 에포크 보상의 5%를 수령한다.
    - **복구 후 루트 교체 검증 (`repair_log` + VRF 1개 랜덤 감사):** 지연 복구로 `new_blobs_root`가 변경된 경우, `repair_log` 중 VRF가 지목한 슬롯 1개에 대해 부모 조각 2개(`old_root` 기준 KZG 검증)와 새 조각(`new_root` 기준 KZG 검증 및 `new_eval == a_eval + factor_b * b_eval`·G1 점 덧셈 일치)을 확인하여 $O(1)$ 비용으로 루트 교체를 승인한다.
@@ -183,13 +183,13 @@ flowchart LR
 #### 핵심 구현 모듈
 1. **`fountain.rs` ($\mathbb{F}_p$ 파운틴 인코딩, 로컬 선형 결합 복구 및 가우스-조르당 디코딩)**
    - 원본 데이터를 `BYTES_PER_SCALAR = 31` 단위로 오버플로우 없이 `BLS12-381 Fr` 스칼라로 패킹하고, $k=30$개 소스 조각 + $(n-k)$개 $\mathbb{F}_p$ 선형 결합 패리티 조각($n=100$)으로 분할 인코딩(`encode`).
-   - `repair_local_field(a: &Shard, b: &Shard, factor_b: Scalar) -> Result<Shard>`: 원본 디코딩 없이 살아남은 조각 2개의 스칼라 블록들을 $S_{\text{new}} = S_A + \text{factor\_b} \cdot S_B \pmod p$로 모듈러 연산하여 신규 패리티 조각 즉석 생성.
+   - `repair_local_field(a: &Shard, b: &Shard, factor_b: Scalar) -> Result<Shard>`: 원본 디코딩 없이 살아남은 조각 2개의 스칼라 블록들을 $S_{\text{new}} = S_A + \text{factor}_b \cdot S_B \pmod p$로 모듈러 연산하여 신규 패리티 조각 즉석 생성.
    - `try_insert_pivot` / `rank` / `decode`: 선도 열(pivot column) 인덱싱 기반 $\mathbb{F}_p$ 가우스-조르당 소거법으로 $k$개 이상의 선형 독립 조각에서 원본 바이트 및 SHA-256 무결성 검증 복원.
 2. **`verkle_kzg.rs` (2단계 선형 지문 + KZG 다항식 커밋먼트 및 SRS 영속화)**
    - **1단계 (Linear Homomorphic Fingerprint):** 각 조각 $S_i$의 스칼라 벡터를 호너법(Horner's method) 다항식 평가($fp(S_i) = \sum m_{i,j} r^j \pmod p$)하여 조각당 32B 지문 추출.
    - **2단계 (KZG Verkle Root):** 100개 조각의 지문 $(0, fp_0), \dots, (99, fp_{99})$ (총 3.2KB)을 뉴턴 보간 + BLS12-381 MSM(`ark-bls12-381 0.5.0`)으로 커밋하여 48B 루트 $C = [P(s)]G$ 및 몫 다항식 오프닝 증명 $\pi_i = [Q(s)]G$ 생성. 분산 노드 디스크 공유를 위해 `to_bytes` / `from_bytes` 직렬화도 제공.
 3. **`pollution_guard.rs` (비잔틴 오염 공격 $O(1)$ 타원곡선 점 덧셈 검증)**
-   - $\mathbb{F}_p$ 선형 동형성에 의해 $\text{Commit}(S_A + \text{factor\_b} \cdot S_B \pmod p) == \text{Commit}(S_A) + \text{factor\_b} \cdot \text{Commit}(S_B)$ 등식이 대수적으로 100% 성립.
+   - $\mathbb{F}_p$ 선형 동형성에 의해 $\text{Commit}(S_A + \text{factor}_b \cdot S_B \pmod p) == \text{Commit}(S_A) + \text{factor}_b \cdot \text{Commit}(S_B)$ 등식이 대수적으로 100% 성립.
    - `verify_homomorphic_repair`로 원본 파일 데이터 다운로드 없이 48B 타원곡선 점 연산(릴리즈 실측 `3.619 ms`)으로 위조·오염 조각을 즉각 색출.
 
 ---
@@ -345,7 +345,7 @@ pub struct Slot {
 2. **복구 가능성(Rank) 체크:** `self.online_rank() < self.k(30)`이면 이미 독립 조각이 부족해 복원이 불가능하므로 `Err(Error::Unavailable)`를 반환한다.
 3. **후보 조각 합성 및 동형 오염 검증 루프:**
    - 접근 가능한 두 부모 조각 `(ia, a)`와 `(ib, b)`를 순회하며 `repair_local_field(a, b, factor_b)`를 호출해 후보 조각 `candidate`를 생성한다.
-   - `verify_homomorphic_repair(kzg, root, auth_a, auth_b, factor_b, &candidate)`를 호출하여 부모 조각 $a, b$가 KZG 루트에 등록된 진짜 조각인지, 그리고 `candidate`의 48B KZG 지문 커밋먼트가 $\text{Commit}(fp(A)) + \text{factor\_b} \cdot \text{Commit}(fp(B))$와 일치하는지 $O(1)$ 검증한다.
+   - `verify_homomorphic_repair(kzg, root, auth_a, auth_b, factor_b, &candidate)`를 호출하여 부모 조각 $a, b$가 KZG 루트에 등록된 진짜 조각인지, 그리고 `candidate`의 48B KZG 지문 커밋먼트가 $\text{Commit}(fp(A)) + \text{factor}_b \cdot \text{Commit}(fp(B))$와 일치하는지 $O(1)$ 검증한다.
 4. **원자적 상태 반영 (Staging):**
    - 필요한 개수(`needed = target(60) - active`)만큼 후보가 모두 모이고 검증을 통과할 때까지 원본 `self`를 건드리지 않고, `staged = self.clone()` 복사본의 대상 슬롯을 갱신(`generation += 1`, `custodian_slot` 배정)한 뒤 마지막에 `*self = staged`로 한 번에 교체한다.
 
