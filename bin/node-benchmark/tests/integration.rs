@@ -1,5 +1,7 @@
 use l1_state_engine::consensus::{BftEngine, ValidatorInfo, ValidatorSigner};
-use l1_state_engine::executor::{sign_registration, Executor, ExecutorConfig};
+use l1_state_engine::executor::{
+    expected_unchanged_slot_index, sign_registration, Executor, ExecutorConfig,
+};
 use l1_state_engine::shuffler::{route_file_to_swarm, shuffle, NodeDescriptor, ShuffleConfig};
 use l1_state_engine::state_db::{NativeTransaction, RepairEntry, SWARM_SIZE};
 use l1_state_engine::Error as L1Error;
@@ -368,4 +370,103 @@ fn delayed_slashing_triggers_after_grace_period_and_replaces_from_standby() {
     assert!(exec.db.nodes[&dead_slot_pk].slashed);
     assert_eq!(exec.db.standby_pool.len(), initial_standby_len - 1);
     assert_ne!(exec.db.swarm_rosters[&0][15], dead_slot_pk);
+}
+
+#[test]
+fn rejects_out_of_order_aggregator_and_tampered_unchanged_slot_on_repair() {
+    let (kzg, mut exec, _bft, _validators, node_keys, descriptors, roster, epoch_seed) =
+        setup_network_and_swarm();
+
+    let payload: Vec<u8> = (0..8_192).map(|i| ((i * 19 + 3) % 251) as u8).collect();
+    let shards = encode(&payload, 30, SWARM_SIZE, 88).unwrap();
+    let init_fps: Vec<Scalar> = shards.iter().map(|s| s.fingerprint()).collect();
+    let init_root = kzg.commit(&init_fps).unwrap();
+    let init_proofs: Vec<[u8; 48]> = (0..SWARM_SIZE)
+        .map(|i| kzg.open(&init_fps, i).unwrap())
+        .collect();
+
+    exec.init_swarm(0, roster.clone(), [0x55; 48], init_root, 10_000)
+        .unwrap();
+
+    // 1. 0번 슬롯이 온라인인데 2번 슬롯이 반장 권한으로 제출 시도 -> Unauthorized
+    let fsm_all_online = LazyRepairFsm::new(shards.clone(), 45, 60).unwrap();
+    let slot2_idx = descriptors
+        .iter()
+        .position(|d| d.pubkey_p256 == roster[2])
+        .unwrap();
+    let premature_tx = build_checkpoint_with_bitmap(
+        0,
+        1,
+        &epoch_seed,
+        &kzg,
+        &fsm_all_online,
+        fsm_all_online.uptime_bitmap(),
+        &init_fps,
+        &init_proofs,
+        Vec::new(),
+        2,
+        &node_keys[slot2_idx],
+    )
+    .unwrap();
+    assert!(matches!(
+        exec.execute(premature_tx, &kzg, &epoch_seed),
+        Err(L1Error::Unauthorized)
+    ));
+
+    // 2. 정상 지연 복구 중 비-복구(unchanged) 슬롯의 조각 심볼을 변조한 루트 교체 -> BadProof
+    let mut fsm = LazyRepairFsm::new(shards, 45, 60).unwrap();
+    for i in 0..55 {
+        fsm.drop_node(i, Some(10)).unwrap();
+    }
+    let repair_log = fsm.repair(&kzg, &init_root, &init_proofs).unwrap();
+    assert_eq!(repair_log.len(), 15);
+
+    let agg_slot = select_active_aggregator(&fsm).unwrap();
+    let agg_idx = descriptors
+        .iter()
+        .position(|d| d.pubkey_p256 == roster[agg_slot as usize])
+        .unwrap();
+    let unchanged_slot =
+        expected_unchanged_slot_index(&epoch_seed, 0, 1, &repair_log, SWARM_SIZE).unwrap();
+
+    let mut tampered_fsm = fsm.clone();
+    tampered_fsm.slots[unchanged_slot as usize]
+        .shard
+        .as_mut()
+        .unwrap()
+        .symbols[0] += Scalar::from(1u64);
+
+    let tampered_tx = build_checkpoint(
+        0,
+        1,
+        &epoch_seed,
+        &kzg,
+        &tampered_fsm,
+        &init_fps,
+        &init_proofs,
+        repair_log.clone(),
+        agg_slot,
+        &node_keys[agg_idx],
+    )
+    .unwrap();
+    assert!(matches!(
+        exec.execute(tampered_tx, &kzg, &epoch_seed),
+        Err(L1Error::BadProof)
+    ));
+
+    // 변조되지 않은 정상 FSM으로 제출하면 성공
+    let valid_tx = build_checkpoint(
+        0,
+        1,
+        &epoch_seed,
+        &kzg,
+        &fsm,
+        &init_fps,
+        &init_proofs,
+        repair_log,
+        agg_slot,
+        &node_keys[agg_idx],
+    )
+    .unwrap();
+    exec.execute(valid_tx, &kzg, &epoch_seed).unwrap();
 }

@@ -204,6 +204,15 @@ pub struct SlotMeta {
     pub object_id_hex: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HeartbeatReceiptDto {
+    pub swarm_id: u64,
+    pub epoch: u64,
+    pub target_slot: u8,
+    pub aggregator_slot: u8,
+    pub sig_hex: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct StoredShardEnvelope {
     shard: ShardDto,
@@ -215,6 +224,14 @@ pub struct NodeStorage;
 impl NodeStorage {
     fn slots_dir(data_dir: &Path) -> PathBuf {
         data_dir.join("slots")
+    }
+
+    fn heartbeats_dir(data_dir: &Path) -> PathBuf {
+        data_dir.join("heartbeats")
+    }
+
+    fn heartbeat_path(data_dir: &Path, epoch: u64, target_slot: u8) -> PathBuf {
+        Self::heartbeats_dir(data_dir).join(format!("epoch_{epoch}_slot_{target_slot}.json"))
     }
 
     fn meta_path(data_dir: &Path, slot: u8, is_custodian: bool) -> PathBuf {
@@ -261,19 +278,104 @@ impl NodeStorage {
         Ok(true)
     }
 
+    pub fn load_shard_by_role(
+        data_dir: &Path,
+        slot: u8,
+        is_custodian: bool,
+        object_id_hex: &str,
+    ) -> Result<Option<(ShardDto, String)>> {
+        let path = Self::shard_path(data_dir, slot, is_custodian, object_id_hex);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let env: StoredShardEnvelope = serde_json::from_slice(&fs::read(path)?)?;
+        Ok(Some((env.shard, env.proof_hex)))
+    }
+
     pub fn load_shard(
         data_dir: &Path,
         slot: u8,
         object_id_hex: &str,
     ) -> Result<Option<(ShardDto, String)>> {
         for is_custodian in [false, true] {
-            let path = Self::shard_path(data_dir, slot, is_custodian, object_id_hex);
-            if path.exists() {
-                let env: StoredShardEnvelope = serde_json::from_slice(&fs::read(path)?)?;
-                return Ok(Some((env.shard, env.proof_hex)));
+            if let Some(found) = Self::load_shard_by_role(data_dir, slot, is_custodian, object_id_hex)?
+            {
+                return Ok(Some(found));
             }
         }
         Ok(None)
+    }
+
+    pub fn load_slot_meta(
+        data_dir: &Path,
+        slot: u8,
+        is_custodian: bool,
+    ) -> Result<Option<SlotMeta>> {
+        let path = Self::meta_path(data_dir, slot, is_custodian);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let meta: SlotMeta = serde_json::from_slice(&fs::read(path)?)?;
+        Ok(Some(meta))
+    }
+
+    pub fn remove_custodian_shard(
+        data_dir: &Path,
+        slot: u8,
+        object_id_hex: &str,
+    ) -> Result<()> {
+        let shard_path = Self::shard_path(data_dir, slot, true, object_id_hex);
+        if shard_path.exists() {
+            fs::remove_file(shard_path)?;
+        }
+        let meta_path = Self::meta_path(data_dir, slot, true);
+        if meta_path.exists() {
+            let remove_meta = match fs::read(&meta_path)
+                .ok()
+                .and_then(|b| serde_json::from_slice::<SlotMeta>(&b).ok())
+            {
+                Some(meta) => meta.object_id_hex == object_id_hex,
+                None => true,
+            };
+            if remove_meta {
+                fs::remove_file(meta_path)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn save_heartbeat_receipt(
+        data_dir: &Path,
+        swarm_id: u64,
+        epoch: u64,
+        target_slot: u8,
+        aggregator_slot: u8,
+        sig_hex: &str,
+    ) -> Result<()> {
+        let _ = decode_fixed_hex::<64>(sig_hex)?;
+        let dto = HeartbeatReceiptDto {
+            swarm_id,
+            epoch,
+            target_slot,
+            aggregator_slot,
+            sig_hex: sig_hex.to_string(),
+        };
+        let path = Self::heartbeat_path(data_dir, epoch, target_slot);
+        atomic_write(&path, &serde_json::to_vec_pretty(&dto)?)
+    }
+
+    pub fn load_heartbeat_receipt(
+        data_dir: &Path,
+        epoch: u64,
+        target_slot: u8,
+    ) -> Result<Option<(u8, [u8; 64])>> {
+        let path = Self::heartbeat_path(data_dir, epoch, target_slot);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let dto: HeartbeatReceiptDto = serde_json::from_slice(&fs::read(path)?)?;
+        let sig = decode_fixed_hex::<64>(&dto.sig_hex)?;
+        Ok(Some((dto.aggregator_slot, sig)))
     }
 
     pub fn save_manifest(data_dir: &Path, manifest: &SwarmManifestDto) -> Result<()> {
@@ -436,5 +538,44 @@ mod tests {
         assert_eq!(loaded_manifest.object_id_hex, manifest.object_id_hex);
         assert_eq!(loaded_manifest.custodian_owners, manifest.custodian_owners);
         assert_eq!(loaded_manifest.slot_generations, manifest.slot_generations);
+    }
+
+    #[test]
+    fn node_storage_heartbeat_receipt_and_custodian_cleanup_roundtrip() {
+        let dir = TempDir::new("hb_cust");
+        assert!(NodeStorage::load_heartbeat_receipt(&dir.path, 3, 12)
+            .unwrap()
+            .is_none());
+
+        let sig_bytes = [0xABu8; 64];
+        let sig_hex = hex::encode(sig_bytes);
+        NodeStorage::save_heartbeat_receipt(&dir.path, 0, 3, 12, 1, &sig_hex).unwrap();
+        let expected_path = dir.path.join("heartbeats/epoch_3_slot_12.json");
+        assert!(expected_path.exists());
+
+        let loaded = NodeStorage::load_heartbeat_receipt(&dir.path, 3, 12)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded, (1, sig_bytes));
+
+        // Custodian 메타 조회 및 삭제 테스트
+        let shards = encode(b"custodian cleanup payload", 4, 8, 9).unwrap();
+        let dto = ShardDto::from_shard(&shards[0]);
+        assert!(NodeStorage::save_shard(&dir.path, 4, true, 3, &dto, "cust_pf").unwrap());
+        let meta = NodeStorage::load_slot_meta(&dir.path, 4, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(meta.slot, 4);
+        assert_eq!(meta.generation, 3);
+        assert!(meta.is_custodian);
+        assert_eq!(meta.object_id_hex, dto.object_id_hex);
+
+        NodeStorage::remove_custodian_shard(&dir.path, 4, &dto.object_id_hex).unwrap();
+        assert!(NodeStorage::load_slot_meta(&dir.path, 4, true)
+            .unwrap()
+            .is_none());
+        assert!(NodeStorage::load_shard(&dir.path, 4, &dto.object_id_hex)
+            .unwrap()
+            .is_none());
     }
 }
