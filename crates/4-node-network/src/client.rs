@@ -1,13 +1,16 @@
-use crate::persistence::compressed_pubkey;
-use crate::storage_daemon::slot_signing_key;
+use crate::storage_daemon::sorted_slot_keys;
 use crate::wire::{
     decode_fixed_hex, http_request_json, send_p2p, FinalizedBlockDto, InitSwarmRequest,
     L1StatusDto, P2pRequest, P2pResponse, ShardDto, SlotAssignmentDto, SwarmClusterMapDto,
     SwarmManifestDto, TxDto,
 };
 use crate::{Error, Result};
-use l1_state_engine::shuffler::route_file_to_swarm;
-use l1_state_engine::state_db::{compute_member_verkle_root, NativeTransaction, SWARM_SIZE};
+use l1_state_engine::shuffler::{route_file_to_swarm, swarm_params};
+use l1_state_engine::state_db::{
+    compute_member_verkle_root, NativeTransaction, DEFAULT_UPTIME_BPS, MAX_SWARM_SIZE,
+    MIN_SWARM_SIZE,
+};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use tokio::task::JoinSet;
@@ -19,24 +22,26 @@ pub fn build_cluster_map(
     chain_id: u64,
     node_endpoints: &[(u64, SocketAddr, SocketAddr)],
 ) -> Result<SwarmClusterMapDto> {
-    if node_endpoints.is_empty() {
-        return Err(Error::Network("node_endpoints cannot be empty".into()));
-    }
-    let mut slots = Vec::with_capacity(SWARM_SIZE);
     let n = node_endpoints.len();
-    for slot in 0..SWARM_SIZE {
-        let node_idx = (slot * n) / SWARM_SIZE;
-        let (node_id, p2p_addr, rpc_addr) = node_endpoints[node_idx];
-        let sk = slot_signing_key(slot as u8);
-        let pk = compressed_pubkey(&sk);
-        slots.push(SlotAssignmentDto {
-            slot: slot as u8,
-            node_id,
-            p2p_addr: p2p_addr.to_string(),
-            rpc_addr: rpc_addr.to_string(),
-            pubkey_hex: hex::encode(pk),
-        });
+    if !(MIN_SWARM_SIZE..=MAX_SWARM_SIZE).contains(&n) {
+        return Err(Error::Network(format!(
+            "node count {n} must be within {MIN_SWARM_SIZE}..={MAX_SWARM_SIZE}"
+        )));
     }
+    let slots = sorted_slot_keys(n)
+        .into_iter()
+        .zip(node_endpoints)
+        .enumerate()
+        .map(
+            |(slot, ((_, _, pk), &(node_id, p2p_addr, rpc_addr)))| SlotAssignmentDto {
+                slot: slot as u8,
+                node_id,
+                p2p_addr: p2p_addr.to_string(),
+                rpc_addr: rpc_addr.to_string(),
+                pubkey_hex: hex::encode(pk),
+            },
+        )
+        .collect();
     Ok(SwarmClusterMapDto {
         swarm_id,
         chain_id,
@@ -80,24 +85,59 @@ pub async fn upload_payload(
     initial_bounty: u128,
     seed: u64,
 ) -> Result<(SwarmManifestDto, Option<FinalizedBlockDto>)> {
-    let shards = encode(payload, 30, SWARM_SIZE, seed)?;
+    let status: L1StatusDto =
+        http_request_json::<(), L1StatusDto>(l1_rpc_url, "GET", "/status", None).await?;
+    let epoch_seed = decode_fixed_hex::<32>(&status.epoch_seed_hex)?;
+    let object_id: [u8; 32] = Sha256::digest(payload).into();
+    let target_swarm_id = route_file_to_swarm(&object_id, &epoch_seed, status.swarm_count.max(1))?;
+
+    let target_swarm = if status.swarms.is_empty() {
+        None
+    } else {
+        Some(
+            status
+                .swarms
+                .iter()
+                .find(|s| s.swarm_id == target_swarm_id)
+                .unwrap_or_else(|| {
+                    &status.swarms[(target_swarm_id as usize) % status.swarms.len()]
+                }),
+        )
+    };
+    let roster_pubkeys_hex: Vec<String> = match target_swarm {
+        Some(sw) => sw.roster_pubkeys_hex.clone(),
+        None => cluster_map
+            .slots
+            .iter()
+            .map(|s| s.pubkey_hex.clone())
+            .collect(),
+    };
+    let ema_by_pubkey: BTreeMap<&str, u16> = status
+        .nodes
+        .iter()
+        .map(|n| (n.pubkey_hex.as_str(), n.ema_uptime_bps))
+        .collect();
+    let n = roster_pubkeys_hex.len();
+    let uptime_sum: u64 = roster_pubkeys_hex
+        .iter()
+        .map(|pk| {
+            u64::from(
+                ema_by_pubkey
+                    .get(pk.as_str())
+                    .copied()
+                    .unwrap_or(DEFAULT_UPTIME_BPS),
+            )
+        })
+        .sum();
+    let params = swarm_params(n, (uptime_sum / n.max(1) as u64) as u16)?;
+
+    let shards = encode(payload, params.k as usize, n, seed)?;
     let fps: Vec<Scalar> = shards.iter().map(|s| s.fingerprint()).collect();
     let root = kzg.commit(&fps)?;
     let proofs: Vec<KzgProof> = kzg.open_all(&fps)?;
     let root_hex = hex::encode(root);
 
-    let status: L1StatusDto =
-        http_request_json::<(), L1StatusDto>(l1_rpc_url, "GET", "/status", None).await?;
-    let epoch_seed = decode_fixed_hex::<32>(&status.epoch_seed_hex)?;
-    let target_swarm_id =
-        route_file_to_swarm(&shards[0].object_id, &epoch_seed, status.swarm_count.max(1))?;
-
-    let (swarm_id, roster_pubkeys_opt, maybe_block) = if !status.swarms.is_empty() {
-        let target_swarm = status
-            .swarms
-            .iter()
-            .find(|s| s.swarm_id == target_swarm_id)
-            .unwrap_or_else(|| &status.swarms[(target_swarm_id as usize) % status.swarms.len()]);
+    let (swarm_id, roster_pubkeys_opt, maybe_block) = if let Some(target_swarm) = target_swarm {
         let chosen_id = target_swarm.swarm_id;
         let block = if initial_bounty > 0 {
             let tx = TxDto::from_native(&NativeTransaction::DepositStorageBounty {
@@ -116,13 +156,8 @@ pub async fn upload_payload(
         } else {
             None
         };
-        (chosen_id, Some(target_swarm.roster_pubkeys_hex.clone()), block)
+        (chosen_id, Some(roster_pubkeys_hex), block)
     } else {
-        let roster_pubkeys_hex: Vec<String> = cluster_map
-            .slots
-            .iter()
-            .map(|s| s.pubkey_hex.clone())
-            .collect();
         let roster_pks: Vec<[u8; 33]> = roster_pubkeys_hex
             .iter()
             .map(|h| decode_fixed_hex::<33>(h))

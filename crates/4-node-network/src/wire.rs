@@ -356,6 +356,7 @@ pub struct NodeAccountDto {
     pub reward_balance: u128,
     pub consecutive_offline_epochs: u32,
     pub slashed: bool,
+    pub ema_uptime_bps: u16,
 }
 
 impl NodeAccountDto {
@@ -368,6 +369,7 @@ impl NodeAccountDto {
             reward_balance: acc.reward_balance,
             consecutive_offline_epochs: acc.consecutive_offline_epochs,
             slashed: acc.slashed,
+            ema_uptime_bps: acc.ema_uptime_bps,
         }
     }
 
@@ -383,6 +385,7 @@ impl NodeAccountDto {
                 reward_balance: self.reward_balance,
                 consecutive_offline_epochs: self.consecutive_offline_epochs,
                 slashed: self.slashed,
+                ema_uptime_bps: self.ema_uptime_bps,
             },
         ))
     }
@@ -540,6 +543,7 @@ pub struct L1StatusDto {
     pub registered_nodes: usize,
     pub swarm_count: usize,
     pub swarms: Vec<SwarmSummaryDto>,
+    pub nodes: Vec<NodeAccountDto>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

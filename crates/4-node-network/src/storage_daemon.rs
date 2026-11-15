@@ -15,13 +15,13 @@ use l1_state_engine::executor::{
     heartbeat_signing_bytes, sign_registration,
 };
 use l1_state_engine::shuffler::score_node;
-use l1_state_engine::state_db::{NativeTransaction, RepairAuditProof, RepairEntry, SWARM_SIZE};
+use l1_state_engine::state_db::{NativeTransaction, RepairAuditProof, RepairEntry, MAX_SWARM_SIZE};
 use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinSet;
 use verkle_fountain::fountain::{rank, repair_local_field, Shard};
@@ -38,8 +38,8 @@ pub struct StorageDaemonConfig {
     pub l1_rpc_url: String,
     pub cluster_map: SwarmClusterMapDto,
     pub data_dir: PathBuf,
-    pub trigger: usize,
-    pub target: usize,
+    pub ip_subnet_hash: u16,
+    pub country_code: u8,
     pub kzg_seed: u64,
 }
 
@@ -52,8 +52,8 @@ struct StorageRuntimeState {
     slot_keys: BTreeMap<u8, SigningKey>,
     kzg: Arc<Kzg>,
     data_dir: PathBuf,
-    trigger: usize,
-    target: usize,
+    ip_subnet_hash: u16,
+    country_code: u8,
 }
 
 pub struct StorageDaemonHandle {
@@ -92,46 +92,42 @@ struct RunCycleBody {
     object_id_hex: Option<String>,
 }
 
-fn sorted_slot_keys() -> &'static [(u64, SigningKey, [u8; 33])] {
-    static SORTED: OnceLock<Vec<(u64, SigningKey, [u8; 33])>> = OnceLock::new();
-    SORTED.get_or_init(|| {
-        let mut entries: Vec<(u64, SigningKey, [u8; 33], [u8; 32])> = (0..SWARM_SIZE)
-            .map(|i| {
-                let raw_seed = 5000 + i as u64;
-                let sk = deterministic_signing_key(raw_seed);
-                let pk = compressed_pubkey(&sk);
-                let score = score_node(&pk, &DEFAULT_EPOCH_SEED);
-                (raw_seed, sk, pk, score)
-            })
-            .collect();
-        entries.sort_by(|a, b| a.3.cmp(&b.3).then_with(|| a.2.cmp(&b.2)));
-        entries
-            .into_iter()
-            .map(|(seed, sk, pk, _)| (seed, sk, pk))
-            .collect()
-    })
+pub fn sorted_slot_keys(n: usize) -> Vec<(u64, SigningKey, [u8; 33])> {
+    let mut entries: Vec<(u64, SigningKey, [u8; 33], [u8; 32])> = (0..n)
+        .map(|i| {
+            let raw_seed = 5000 + i as u64;
+            let sk = deterministic_signing_key(raw_seed);
+            let pk = compressed_pubkey(&sk);
+            let score = score_node(&pk, &DEFAULT_EPOCH_SEED);
+            (raw_seed, sk, pk, score)
+        })
+        .collect();
+    entries.sort_by(|a, b| a.3.cmp(&b.3).then_with(|| a.2.cmp(&b.2)));
+    entries
+        .into_iter()
+        .map(|(seed, sk, pk, _)| (seed, sk, pk))
+        .collect()
 }
 
-pub fn slot_key_seed(slot: u8) -> u64 {
-    sorted_slot_keys()
+pub fn slot_key_seed(slot: u8, n: usize) -> u64 {
+    sorted_slot_keys(n)
         .get(slot as usize)
         .map(|(seed, _, _)| *seed)
         .unwrap_or(5000 + slot as u64)
-}
-
-pub fn slot_signing_key(slot: u8) -> SigningKey {
-    sorted_slot_keys()
-        .get(slot as usize)
-        .map(|(_, sk, _)| sk.clone())
-        .unwrap_or_else(|| deterministic_signing_key(5000 + slot as u64))
 }
 
 pub async fn start_storage_daemon(config: StorageDaemonConfig) -> Result<StorageDaemonHandle> {
     std::fs::create_dir_all(&config.data_dir)?;
     let mut slot_keys = BTreeMap::new();
     for &slot in &config.slots {
-        let key_path = config.data_dir.join("keys").join(format!("slot_{slot}.hex"));
-        let key = load_or_create_signing_key(&key_path, slot_key_seed(slot))?;
+        let key_path = config
+            .data_dir
+            .join("keys")
+            .join(format!("slot_{slot}.hex"));
+        let key = load_or_create_signing_key(
+            &key_path,
+            slot_key_seed(slot, config.cluster_map.slots.len()),
+        )?;
         slot_keys.insert(slot, key);
     }
 
@@ -142,7 +138,7 @@ pub async fn start_storage_daemon(config: StorageDaemonConfig) -> Result<Storage
     };
     let kzg = Arc::new(ValidatorStorage::load_or_create_kzg(
         &config.data_dir,
-        SWARM_SIZE - 1,
+        MAX_SWARM_SIZE - 1,
         kzg_seed,
     )?);
 
@@ -159,8 +155,8 @@ pub async fn start_storage_daemon(config: StorageDaemonConfig) -> Result<Storage
         slot_keys,
         kzg,
         data_dir: config.data_dir,
-        trigger: config.trigger,
-        target: config.target,
+        ip_subnet_hash: config.ip_subnet_hash,
+        country_code: config.country_code,
     });
 
     let p2p_task = spawn_tcp_server(p2p_listener, Arc::clone(&state), handle_storage_p2p);
@@ -420,16 +416,19 @@ async fn handle_storage_rpc(mut stream: TcpStream, state: Arc<StorageRuntimeStat
         }
         ("POST", "/register_slots") => {
             let mut txs = Vec::with_capacity(state.slot_keys.len());
-            for (&slot, sk) in &state.slot_keys {
-                let subnet = (slot as u16) / 2;
-                let country = slot % 8;
-                let (pk, sig) =
-                    sign_registration(sk, state.cluster_map.chain_id, subnet, country, 1_500);
+            for sk in state.slot_keys.values() {
+                let (pk, sig) = sign_registration(
+                    sk,
+                    state.cluster_map.chain_id,
+                    state.ip_subnet_hash,
+                    state.country_code,
+                    1_500,
+                );
                 txs.push(TxDto::from_native(&NativeTransaction::RegisterMobileNode {
                     pubkey_p256: pk,
                     hw_attestation_sig: sig,
-                    ip_subnet_hash: subnet,
-                    country_code: country,
+                    ip_subnet_hash: state.ip_subnet_hash,
+                    country_code: state.country_code,
                     stake: 1_500,
                 }));
             }
@@ -651,6 +650,16 @@ async fn execute_aggregator_cycle(
         http_request_json::<(), L1StatusDto>(&state.l1_rpc_url, "GET", "/status", None).await?;
     let epoch_seed = decode_fixed_hex::<32>(&l1_status.epoch_seed_hex)?;
 
+    let swarm_state = &l1_status
+        .swarms
+        .iter()
+        .find(|s| s.swarm_id == state.swarm_id)
+        .ok_or_else(|| Error::Network("swarm missing on L1".into()))?
+        .state;
+    let n = swarm_state.swarm_size_n as usize;
+    let trigger = swarm_state.lazy_repair_trigger as usize;
+    let target = swarm_state.lazy_repair_target as usize;
+
     let mut manifest = select_cycle_manifest(state, &l1_status, object_id_hex)?;
 
     let old_root = root_from_hex(&manifest.root_hex)?;
@@ -664,7 +673,7 @@ async fn execute_aggregator_cycle(
         .iter()
         .map(|h| proof_from_hex(h))
         .collect::<Result<Vec<_>>>()?;
-    if old_fps.len() != SWARM_SIZE || old_proofs.len() != SWARM_SIZE {
+    if old_fps.len() != n || old_proofs.len() != n {
         return Err(Error::Network("manifest length mismatch".into()));
     }
 
@@ -690,13 +699,15 @@ async fn execute_aggregator_cycle(
     let mut repair_log: Vec<RepairEntry> = Vec::new();
     let online_vec: Vec<u8> = online_slots.iter().copied().collect();
 
-    if accessible_before <= state.trigger {
+    if accessible_before <= trigger {
         let accessible_set: BTreeSet<usize> = accessible.iter().map(|(s, _)| *s).collect();
-        let target_slots: Vec<u8> = (0..SWARM_SIZE)
+        let target_slots: Vec<u8> = (0..n)
             .filter(|i| !accessible_set.contains(i))
             .map(|i| i as u8)
             .collect();
-        let needed = state.target.saturating_sub(accessible_before).min(target_slots.len());
+        let needed = target
+            .saturating_sub(accessible_before)
+            .min(target_slots.len());
         let parent_pool = accessible.clone();
         let m = parent_pool.len();
 
@@ -787,7 +798,7 @@ async fn execute_aggregator_cycle(
         (root, proofs)
     };
 
-    let sample_index = expected_sample_index(&epoch_seed, state.swarm_id, epoch, SWARM_SIZE);
+    let sample_index = expected_sample_index(&epoch_seed, state.swarm_id, epoch, n);
     let sample_eval = scalar_to_bytes(&new_fps[sample_index as usize]);
     let kzg_sample_proof = new_proofs[sample_index as usize];
 
@@ -800,14 +811,11 @@ async fn execute_aggregator_cycle(
         let pa = entry.parent_slot_a as usize;
         let pb = entry.parent_slot_b as usize;
         let pr = entry.repaired_slot as usize;
-        let unchanged_slot = expected_unchanged_slot_index(
-            &epoch_seed,
-            state.swarm_id,
-            epoch,
-            &repair_log,
-            SWARM_SIZE,
-        )
-        .ok_or_else(|| Error::Network("no unchanged slot available for repair audit".into()))?;
+        let unchanged_slot =
+            expected_unchanged_slot_index(&epoch_seed, state.swarm_id, epoch, &repair_log, n)
+                .ok_or_else(|| {
+                    Error::Network("no unchanged slot available for repair audit".into())
+                })?;
         let unchanged_idx = unchanged_slot as usize;
 
         Some(RepairAuditProof {
