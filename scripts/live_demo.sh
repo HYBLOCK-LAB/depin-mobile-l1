@@ -74,7 +74,7 @@ for id in 0 1 2 3; do
   wait_health "http://127.0.0.1:$((19110 + id))"
 done
 
-echo "[3/8] Launching 10 storage node processes (100 swarm slots) & registering on L1..."
+echo "[3/8] Launching 10 storage node processes (10 swarm slots, 1 slot per node) & registering on L1..."
 NODE_PIDS=()
 for nid in $(seq 0 9); do
   "$NODE_BIN" storage \
@@ -84,6 +84,8 @@ for nid in $(seq 0 9); do
     --l1-rpc "http://127.0.0.1:19110" \
     --cluster-map "$CLUSTER_MAP" \
     --data-dir "$DEMO_DIR/storage_$nid" \
+    --ip-subnet-hash "$nid" \
+    --country-code "$((nid % 8))" \
     >"$DEMO_DIR/logs/storage_$nid.log" 2>&1 &
   pid=$!
   PIDS+=("$pid")
@@ -96,7 +98,7 @@ done
 
 "$CLI_BIN" register-all --cluster-map "$CLUSTER_MAP"
 
-echo "[4/8] Generating 64KB sample file and uploading 100 F_p shards over TCP..."
+echo "[4/8] Generating 64KB sample file and uploading 10 F_p shards over TCP..."
 dd if=/dev/urandom of="$DEMO_DIR/sample.bin" bs=1024 count=64 2>/dev/null
 ORIG_SHA="$(shasum -a 256 "$DEMO_DIR/sample.bin" | awk '{print $1}')"
 UPLOAD_JSON="$("$CLI_BIN" upload \
@@ -108,14 +110,14 @@ UPLOAD_JSON="$("$CLI_BIN" upload \
 echo "$UPLOAD_JSON"
 OBJECT_ID="$(echo "$UPLOAD_JSON" | grep object_id_hex | sed -E 's/.*"object_id_hex": *"([^"]+)".*/\1/')"
 
-echo "[5/8] Killing validator #3 and 6 storage nodes (slots 0..59 offline -> 40 active <= T_repair 45)..."
+echo "[5/8] Killing validator #3 and 6 storage nodes (slots 0..5 offline -> 4 active <= T_repair 4)..."
 kill -9 "${VAL_PIDS[3]}" 2>/dev/null || true
 for nid in 0 1 2 3 4 5; do
   kill -9 "${NODE_PIDS[$nid]}" 2>/dev/null || true
 done
 sleep 0.2
 
-echo "[6/8] Triggering epoch 1 aggregator cycle on surviving successor Node #6 (slot 60)..."
+echo "[6/8] Triggering epoch 1 aggregator cycle on surviving successor Node #6 (slot 6)..."
 "$CLI_BIN" run-cycle --node-rpc "http://127.0.0.1:19306" --epoch 1
 
 echo "[7/8] Restarting validator #0 from disk snapshot and verifying L1 state recovery..."

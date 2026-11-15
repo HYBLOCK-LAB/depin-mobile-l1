@@ -16,27 +16,31 @@ mod bytes48 {
     }
 }
 
-pub const SWARM_SIZE: usize = 100;
+pub const MIN_SWARM_SIZE: usize = 10;
+pub const MAX_SWARM_SIZE: usize = 128;
+pub const DEFAULT_UPTIME_BPS: u16 = 7_500;
 
 /// L1 글로벌 상태 DB에 저장되는 가상 스웜 추상화 상태 객체 (고정 크기 148 Bytes)
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VirtualSwarmState {
     pub swarm_id: u64,
     #[serde(with = "bytes48")]
-    pub member_verkle_root: [u8; 48],  // 100대 모바일 노드 공개키(P-256) 및 지분 KZG 루트
+    pub member_verkle_root: [u8; 48],  // 스웜 모바일 노드 공개키(P-256) 및 지분 KZG 루트
     #[serde(with = "bytes48")]
     pub active_blobs_root: [u8; 48],   // 보관 중인 파일 조각들의 KZG 루트
     pub total_bond_balance: u128,      // 스웜 공동 스테이킹 담보금
     pub storage_bounty_pool: u128,     // 유저들이 예치한 보관 보상금(Bounty) 풀
     pub last_epoch_settled: u64,       // 마지막 정산 에포크 번호
-    pub min_threshold_k: u16,          // 최소 복구 조각 수 (30)
-    pub lazy_repair_trigger: u16,      // 지연 복구 발동 임계선 T_repair (45)
+    pub swarm_size_n: u8,
+    pub min_threshold_k: u8,
+    pub lazy_repair_trigger: u8,
+    pub lazy_repair_target: u8,
 }
 
 impl VirtualSwarmState {
     /// 직렬화된 고정 바이너리 크기 (Bytes)
     pub const fn encoded_bytes_len() -> usize {
-        8 + 48 + 48 + 16 + 16 + 8 + 2 + 2 // = 148 Bytes
+        8 + 48 + 48 + 16 + 16 + 8 + 1 + 1 + 1 + 1 // = 148 Bytes
     }
 }
 
@@ -143,6 +147,7 @@ pub struct NodeAccount {
     pub reward_balance: u128,
     pub consecutive_offline_epochs: u32,
     pub slashed: bool,
+    pub ema_uptime_bps: u16,
 }
 
 /// [비교 Baseline] 100대 노드의 개별 주소·슬롯·상태를 온체인에 각각 기록하는 레거시 상태 DB
@@ -207,13 +212,13 @@ pub fn member_leaf_scalar(pubkey_p256: &[u8; 33]) -> Scalar {
 }
 
 fn member_leaves(roster: &[[u8; 33]]) -> Result<Vec<Scalar>> {
-    if roster.len() != SWARM_SIZE {
+    if !(MIN_SWARM_SIZE..=MAX_SWARM_SIZE).contains(&roster.len()) {
         return Err(crate::Error::InvalidInput);
     }
     Ok(roster.iter().map(member_leaf_scalar).collect())
 }
 
-/// 100대 스웜 로스터 공개키 벡터를 48B KZG/Verkle 멤버십 루트로 커밋한다.
+/// 스웜 로스터 공개키 벡터를 48B KZG/Verkle 멤버십 루트로 커밋한다.
 pub fn compute_member_verkle_root(kzg: &Kzg, roster: &[[u8; 33]]) -> Result<KzgRoot> {
     let leaves = member_leaves(roster)?;
     kzg.commit(&leaves).map_err(|_| crate::Error::BadProof)
@@ -221,7 +226,7 @@ pub fn compute_member_verkle_root(kzg: &Kzg, roster: &[[u8; 33]]) -> Result<KzgR
 
 /// 특정 슬롯의 멤버 공개키에 대한 48B KZG/Verkle 멤버십 오프닝 증명을 생성한다.
 pub fn open_member_verkle_proof(kzg: &Kzg, roster: &[[u8; 33]], slot: usize) -> Result<KzgProof> {
-    if slot >= SWARM_SIZE {
+    if slot >= roster.len() {
         return Err(crate::Error::InvalidInput);
     }
     let leaves = member_leaves(roster)?;
@@ -236,7 +241,7 @@ pub fn verify_member_verkle_proof(
     pubkey_p256: &[u8; 33],
     proof: &KzgProof,
 ) -> Result<()> {
-    if slot >= SWARM_SIZE {
+    if slot >= MAX_SWARM_SIZE {
         return Err(crate::Error::BadProof);
     }
     kzg.verify(member_root, slot, member_leaf_scalar(pubkey_p256), proof)
@@ -320,7 +325,8 @@ mod tests {
         assert_eq!(LegacySlotRecord::encoded_bytes_len(), 89);
         assert_eq!(VirtualSwarmState::encoded_bytes_len(), 148);
 
-        let owners: Vec<[u8; 33]> = (0..SWARM_SIZE)
+        const N: usize = 100;
+        let owners: Vec<[u8; 33]> = (0..N)
             .map(|i| {
                 let mut pk = [0u8; 33];
                 pk[0] = 0x02;
@@ -349,8 +355,10 @@ mod tests {
                 total_bond_balance: 100_000,
                 storage_bounty_pool: 5_000,
                 last_epoch_settled: 0,
+                swarm_size_n: 100,
                 min_threshold_k: 30,
                 lazy_repair_trigger: 45,
+                lazy_repair_target: 60,
             },
         );
         assert_eq!(enshrined.swarm_headers_bytes(), 148);
@@ -368,6 +376,7 @@ mod tests {
                     reward_balance: 0,
                     consecutive_offline_epochs: 0,
                     slashed: false,
+                    ema_uptime_bps: DEFAULT_UPTIME_BPS,
                 },
             );
         }
@@ -385,9 +394,10 @@ mod tests {
         use rand::{rngs::StdRng, SeedableRng};
 
         let mut rng = StdRng::seed_from_u64(303);
-        let kzg = Kzg::setup(SWARM_SIZE - 1, &mut rng);
+        const N: usize = 100;
+        let kzg = Kzg::setup(MAX_SWARM_SIZE - 1, &mut rng);
 
-        let roster: Vec<[u8; 33]> = (0..SWARM_SIZE)
+        let roster: Vec<[u8; 33]> = (0..N)
             .map(|i| {
                 let mut pk = [0u8; 33];
                 pk[0] = 0x02;
@@ -403,15 +413,15 @@ mod tests {
 
         // 로스터 길이 불일치 및 슬롯 범위 초과 거부
         assert!(matches!(
-            compute_member_verkle_root(&kzg, &roster[..99]),
+            compute_member_verkle_root(&kzg, &roster[..MIN_SWARM_SIZE - 1]),
             Err(crate::Error::InvalidInput)
         ));
         assert!(matches!(
-            open_member_verkle_proof(&kzg, &roster[..99], 0),
+            open_member_verkle_proof(&kzg, &roster[..MIN_SWARM_SIZE - 1], 0),
             Err(crate::Error::InvalidInput)
         ));
         assert!(matches!(
-            open_member_verkle_proof(&kzg, &roster, SWARM_SIZE),
+            open_member_verkle_proof(&kzg, &roster, N),
             Err(crate::Error::InvalidInput)
         ));
 
@@ -421,7 +431,7 @@ mod tests {
             verify_member_verkle_proof(&kzg, &member_root, slot, &roster[slot], &proof).unwrap();
 
             // 다른 공개키, 다른 슬롯, 변조된 루트, 범위 초과 슬롯 모두 거부
-            let other_slot = (slot + 1) % SWARM_SIZE;
+            let other_slot = (slot + 1) % N;
             assert!(matches!(
                 verify_member_verkle_proof(&kzg, &member_root, slot, &roster[other_slot], &proof),
                 Err(crate::Error::BadProof)
@@ -441,7 +451,7 @@ mod tests {
 
         let proof0 = open_member_verkle_proof(&kzg, &roster, 0).unwrap();
         assert!(matches!(
-            verify_member_verkle_proof(&kzg, &member_root, SWARM_SIZE, &roster[0], &proof0),
+            verify_member_verkle_proof(&kzg, &member_root, MAX_SWARM_SIZE, &roster[0], &proof0),
             Err(crate::Error::BadProof)
         ));
     }
@@ -569,6 +579,7 @@ mod tests {
                     reward_balance: 0,
                     consecutive_offline_epochs: 0,
                     slashed,
+                    ema_uptime_bps: DEFAULT_UPTIME_BPS,
                 },
             );
         }

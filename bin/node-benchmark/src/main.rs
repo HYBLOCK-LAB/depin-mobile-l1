@@ -1,8 +1,11 @@
 use l1_state_engine::consensus::{BftEngine, ValidatorInfo, ValidatorSigner};
 use l1_state_engine::executor::{sign_registration, Executor, ExecutorConfig};
-use l1_state_engine::shuffler::{route_file_to_swarm, shuffle, NodeDescriptor, ShuffleConfig};
+use l1_state_engine::shuffler::{
+    route_file_to_swarm, shuffle, swarm_params, swarm_sizes, NodeDescriptor, ShuffleConfig,
+};
 use l1_state_engine::state_db::{
-    compute_member_verkle_root, LegacyStateDB, NativeTransaction, VirtualSwarmState, SWARM_SIZE,
+    compute_member_verkle_root, LegacyStateDB, NativeTransaction, VirtualSwarmState,
+    DEFAULT_UPTIME_BPS, MAX_SWARM_SIZE,
 };
 use p256::ecdsa::SigningKey;
 use rand::SeedableRng;
@@ -33,7 +36,16 @@ fn main() {
     println!("==================================================================\n");
 
     let mut rng = ChaCha8Rng::seed_from_u64(42);
-    let kzg = Kzg::setup(SWARM_SIZE - 1, &mut rng);
+    let kzg = Kzg::setup(MAX_SWARM_SIZE - 1, &mut rng);
+
+    const NODE_COUNT: usize = 120;
+    let n = swarm_sizes(NODE_COUNT)[0];
+    let params = swarm_params(n, DEFAULT_UPTIME_BPS).expect("swarm params");
+    let (k, t_repair, t_target) = (
+        params.k as usize,
+        params.t_repair as usize,
+        params.t_target as usize,
+    );
 
     // ------------------------------------------------------------------
     // 1. 코딩 및 암호학 코어 벤치마크 (2-verkle-fountain)
@@ -42,7 +54,7 @@ fn main() {
         .map(|i| ((i * 37 + 13) % 251) as u8)
         .collect();
     let t0 = Instant::now();
-    let shards = encode(&sample_data, 30, SWARM_SIZE, 2026).expect("encode");
+    let shards = encode(&sample_data, k, n, 2026).expect("encode");
     let encode_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     let t1 = Instant::now();
@@ -78,7 +90,7 @@ fn main() {
     .expect("homomorphic verify");
     let pollution_check_ms = t3.elapsed().as_secs_f64() * 1000.0;
 
-    let mut decode_subset = shards[71..100].to_vec();
+    let mut decode_subset = shards[n - (k - 1)..].to_vec();
     decode_subset.push(repaired.clone());
     let t4 = Instant::now();
     let recovered = decode(&decode_subset).expect("decode");
@@ -88,21 +100,21 @@ fn main() {
     println!("## [Area 1] 2-verkle-fountain (F_p Linear Fountain + Lagrange KZG, 1MB Payload)");
     println!("| Metric | Value |");
     println!("| :--- | ---: |");
-    println!("| F_p Fountain Encode (k=30, n=100) | {:.3} ms |", encode_ms);
+    println!("| F_p Fountain Encode (k={k}, n={n}) | {:.3} ms |", encode_ms);
     println!("| 2-Stage Fingerprint + 48B KZG Root | {:.3} ms |", commit_ms);
     println!("| Local F_p Linear Repair (1 shard) | {:.3} ms |", repair_ms);
     println!("| Homomorphic Pollution Verification | {:.3} ms |", pollution_check_ms);
-    println!("| Gaussian-Jordan Decode (30 shards) | {:.3} ms |\n", decode_ms);
+    println!("| Gaussian-Jordan Decode ({k} shards) | {:.3} ms |\n", decode_ms);
 
     // ------------------------------------------------------------------
     // 2. 온체인 상태 압축 & BFT 합의 벤치마크 (1-l1-state-engine + 3-swarm-protocol)
     // ------------------------------------------------------------------
     let mut exec = Executor::new(ExecutorConfig::default());
-    let mut node_keys: Vec<SigningKey> = Vec::with_capacity(120);
-    let mut descriptors: Vec<NodeDescriptor> = Vec::with_capacity(120);
-    let mut reg_txs = Vec::with_capacity(120);
+    let mut node_keys: Vec<SigningKey> = Vec::with_capacity(NODE_COUNT);
+    let mut descriptors: Vec<NodeDescriptor> = Vec::with_capacity(NODE_COUNT);
+    let mut reg_txs = Vec::with_capacity(NODE_COUNT);
 
-    for i in 0..120 {
+    for i in 0..NODE_COUNT {
         let sk = deterministic_signing_key(i);
         let ip_subnet = (i / 2) as u16;
         let country = (i % 10) as u8;
@@ -143,20 +155,20 @@ fn main() {
     let swarm_roster = shuffled.swarms[0].clone();
     let _target_swarm = route_file_to_swarm(&shards[0].object_id, &epoch_seed, 1).expect("route");
 
-    // 100대 스웜에 대응하는 LegacyStateDB vs EnshrinedSwarmDB 크기 비교
+    // 편성된 스웜에 대응하는 LegacyStateDB vs EnshrinedSwarmDB 크기 비교
     let mut legacy_db = LegacyStateDB::default();
     legacy_db.insert_blob_slots(0, &swarm_roster);
 
     let member_root = compute_member_verkle_root(&kzg, &swarm_roster).expect("member verkle root");
     exec.init_swarm(0, swarm_roster.clone(), member_root, root, 10_000)
         .expect("init swarm");
-    let mut fsm = LazyRepairFsm::new(shards, 45, 60).expect("fsm");
+    let mut fsm = LazyRepairFsm::new(shards, t_repair, t_target).expect("fsm");
 
-    // 55대 노드 이탈(T_repair = 45 도달) 후 지연 복구 + 반장 승계 + BFT 체크포인트 블록 확정 측정
-    let proofs: Vec<[u8; 48]> = (0..SWARM_SIZE)
+    // (n - T_repair)대 노드 이탈(T_repair 도달) 후 지연 복구 + 반장 승계 + BFT 체크포인트 블록 확정 측정
+    let proofs: Vec<[u8; 48]> = (0..n)
         .map(|i| kzg.open(&fps, i).expect("open"))
         .collect();
-    for i in 0..55 {
+    for i in 0..n - t_repair {
         if i % 3 == 0 {
             let _ = fsm.drop_node(i, None); // 영구 이탈
         } else {
@@ -202,7 +214,8 @@ fn main() {
     println!("| Metric | Legacy Individual Slot DB | Proposed Virtual Swarm L1 |");
     println!("| :--- | ---: | ---: |");
     println!(
-        "| On-chain State Size per Swarm (100 nodes) | {} Bytes | {} Bytes ({:.1}% reduction) |",
+        "| On-chain State Size per Swarm ({} nodes) | {} Bytes | {} Bytes ({:.1}% reduction) |",
+        n,
         legacy_db.total_state_bytes(),
         VirtualSwarmState::encoded_bytes_len(),
         (1.0 - VirtualSwarmState::encoded_bytes_len() as f64 / legacy_db.total_state_bytes() as f64)

@@ -1,5 +1,5 @@
 use crate::{Error, Result};
-use l1_state_engine::state_db::{RepairEntry, SWARM_SIZE};
+use l1_state_engine::state_db::{RepairEntry, MAX_SWARM_SIZE, MIN_SWARM_SIZE};
 use verkle_fountain::fountain::{rank, repair_local_field, Shard};
 use verkle_fountain::pollution_guard::{verify_homomorphic_repair, AuthenticatedShard};
 use verkle_fountain::verkle_kzg::{scalar_to_bytes, Kzg, KzgProof, KzgRoot, Scalar};
@@ -35,10 +35,11 @@ impl LazyRepairFsm {
         let object = first.object_id;
         let len = first.original_len;
 
-        if shards.len() != SWARM_SIZE
+        let n = shards.len();
+        if !(MIN_SWARM_SIZE..=MAX_SWARM_SIZE).contains(&n)
             || k >= trigger
             || trigger >= target
-            || target > SWARM_SIZE
+            || target > n
         {
             return Err(Error::Invalid);
         }
@@ -299,16 +300,18 @@ mod tests {
     use rand_chacha::ChaCha8Rng;
     use verkle_fountain::fountain::encode;
 
+    const TEST_N: usize = 100;
+
     fn make_fsm_fixtures(
         seed: u64,
     ) -> (Vec<Shard>, Kzg, [u8; 48], Vec<[u8; 48]>) {
         let data = vec![0x6Au8; 4096];
-        let shards = encode(&data, 30, SWARM_SIZE, seed).unwrap();
+        let shards = encode(&data, 30, TEST_N, seed).unwrap();
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
-        let kzg = Kzg::setup(SWARM_SIZE - 1, &mut rng);
+        let kzg = Kzg::setup(MAX_SWARM_SIZE - 1, &mut rng);
         let fps: Vec<Scalar> = shards.iter().map(|s| s.fingerprint()).collect();
         let root = kzg.commit(&fps).unwrap();
-        let proofs: Vec<[u8; 48]> = (0..SWARM_SIZE)
+        let proofs: Vec<[u8; 48]> = (0..TEST_N)
             .map(|i| kzg.open(&fps, i).unwrap())
             .collect();
         (shards, kzg, root, proofs)
@@ -327,6 +330,11 @@ mod tests {
         ));
         assert!(matches!(
             LazyRepairFsm::new(shards.clone(), 45, 101),
+            Err(Error::Invalid)
+        ));
+
+        assert!(matches!(
+            LazyRepairFsm::new(shards[..MIN_SWARM_SIZE - 1].to_vec(), 5, 8),
             Err(Error::Invalid)
         ));
 

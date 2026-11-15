@@ -4,7 +4,7 @@ use l1_state_engine::executor::{
     expected_repair_audit_index, expected_sample_index, expected_unchanged_slot_index,
     heartbeat_signing_bytes,
 };
-use l1_state_engine::state_db::{NativeTransaction, RepairAuditProof, RepairEntry, SWARM_SIZE};
+use l1_state_engine::state_db::{NativeTransaction, RepairAuditProof, RepairEntry};
 use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 use verkle_fountain::verkle_kzg::{scalar_to_bytes, Kzg, KzgProof, Scalar};
 
@@ -77,10 +77,10 @@ pub fn build_checkpoint_with_bitmap(
     aggregator_key: &SigningKey,
 ) -> Result<NativeTransaction> {
     let agg_idx = aggregator_slot as usize;
-    if agg_idx >= SWARM_SIZE || fsm.slots[agg_idx].state != NodeState::Online {
+    if agg_idx >= fsm.slots.len() || fsm.slots[agg_idx].state != NodeState::Online {
         return Err(Error::CoordinatorFailed);
     }
-    if old_fingerprints.len() != SWARM_SIZE {
+    if old_fingerprints.len() != fsm.slots.len() {
         return Err(Error::Invalid);
     }
 
@@ -99,7 +99,7 @@ pub fn build_checkpoint_with_bitmap(
         .commit(&new_fps)
         .map_err(|_| Error::CoordinatorFailed)?;
 
-    let sample_index = expected_sample_index(epoch_seed, swarm_id, epoch, SWARM_SIZE);
+    let sample_index = expected_sample_index(epoch_seed, swarm_id, epoch, fsm.slots.len());
     let sample_eval = scalar_to_bytes(&new_fps[sample_index as usize]);
     let kzg_sample_proof = kzg
         .open(&new_fps, sample_index as usize)
@@ -108,7 +108,7 @@ pub fn build_checkpoint_with_bitmap(
     let repair_audit = if repair_log.is_empty() {
         None
     } else {
-        if old_proofs.len() != SWARM_SIZE {
+        if old_proofs.len() != fsm.slots.len() {
             return Err(Error::Invalid);
         }
         let old_blobs_root = kzg
@@ -126,7 +126,7 @@ pub fn build_checkpoint_with_bitmap(
             .map_err(|_| Error::CoordinatorFailed)?;
 
         let unchanged_slot =
-            expected_unchanged_slot_index(epoch_seed, swarm_id, epoch, &repair_log, SWARM_SIZE)
+            expected_unchanged_slot_index(epoch_seed, swarm_id, epoch, &repair_log, fsm.slots.len())
                 .ok_or(Error::CoordinatorFailed)?;
         let unchanged_idx = unchanged_slot as usize;
         let unchanged_new_proof = kzg
@@ -181,11 +181,14 @@ mod tests {
     use super::*;
     use rand::SeedableRng;
     use rand_chacha::ChaCha8Rng;
+    use l1_state_engine::state_db::MAX_SWARM_SIZE;
     use verkle_fountain::fountain::encode;
+
+    const TEST_N: usize = 100;
 
     #[test]
     fn select_active_aggregator_succeeds_in_order_and_fails_when_all_offline() {
-        let shards = encode(b"coordinator test payload", 30, SWARM_SIZE, 5).unwrap();
+        let shards = encode(b"coordinator test payload", 30, TEST_N, 5).unwrap();
         let mut fsm = LazyRepairFsm::new(shards, 45, 60).unwrap();
 
         assert_eq!(select_active_aggregator(&fsm).unwrap(), 0);
@@ -194,7 +197,7 @@ mod tests {
         }
         assert_eq!(select_active_aggregator(&fsm).unwrap(), 3);
 
-        for i in 3..SWARM_SIZE {
+        for i in 3..TEST_N {
             fsm.drop_node(i, None).unwrap();
         }
         assert!(matches!(
@@ -205,11 +208,11 @@ mod tests {
 
     #[test]
     fn build_checkpoint_rejects_offline_or_out_of_range_aggregator() {
-        let shards = encode(&vec![0x19u8; 4096], 30, SWARM_SIZE, 9).unwrap();
+        let shards = encode(&vec![0x19u8; 4096], 30, TEST_N, 9).unwrap();
         let mut rng = ChaCha8Rng::seed_from_u64(9);
-        let kzg = Kzg::setup(SWARM_SIZE - 1, &mut rng);
+        let kzg = Kzg::setup(MAX_SWARM_SIZE - 1, &mut rng);
         let fps: Vec<Scalar> = shards.iter().map(|s| s.fingerprint()).collect();
-        let proofs: Vec<KzgProof> = (0..SWARM_SIZE)
+        let proofs: Vec<KzgProof> = (0..TEST_N)
             .map(|i| kzg.open(&fps, i).unwrap())
             .collect();
 

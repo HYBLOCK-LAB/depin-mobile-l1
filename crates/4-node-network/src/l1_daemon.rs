@@ -3,8 +3,8 @@ use crate::persistence::{
 };
 use crate::wire::{
     decode_fixed_hex, read_frame, read_http_request, root_from_hex, send_p2p, spawn_tcp_server,
-    write_frame, write_http_json, FinalizedBlockDto, InitSwarmRequest, L1StatusDto, P2pRequest,
-    P2pResponse, SwarmSummaryDto, TxDto, VoteDto,
+    write_frame, write_http_json, FinalizedBlockDto, InitSwarmRequest, L1StatusDto, NodeAccountDto,
+    P2pRequest, P2pResponse, SwarmSummaryDto, TxDto, VoteDto,
 };
 use crate::{Error, Result};
 use l1_state_engine::consensus::{
@@ -12,7 +12,9 @@ use l1_state_engine::consensus::{
     Vote, VotePhase,
 };
 use l1_state_engine::executor::{Executor, ExecutorConfig};
-use l1_state_engine::state_db::{compute_member_verkle_root, NativeTransaction, SWARM_SIZE};
+use l1_state_engine::state_db::{
+    compute_member_verkle_root, NativeTransaction, MAX_SWARM_SIZE, MIN_SWARM_SIZE,
+};
 use p256::ecdsa::SigningKey;
 use serde::Serialize;
 use std::net::SocketAddr;
@@ -146,7 +148,7 @@ fn execute_stage(
         }
         receipts.push(staged.execute(native, kzg, epoch_seed)?);
     }
-    if had_registration && staged.db.standby_pool.len() >= SWARM_SIZE {
+    if had_registration && staged.db.standby_pool.len() >= MIN_SWARM_SIZE {
         staged.auto_shuffle_standby_swarms(kzg, epoch_seed, 10_000)?;
     }
     Ok((staged, receipts))
@@ -158,7 +160,7 @@ pub async fn start_validator_daemon(
     std::fs::create_dir_all(&config.data_dir)?;
     let kzg = Arc::new(ValidatorStorage::load_or_create_kzg(
         &config.data_dir,
-        SWARM_SIZE - 1,
+        MAX_SWARM_SIZE - 1,
         config.kzg_seed,
     )?);
     let key_path = config.data_dir.join("validator_key.hex");
@@ -496,6 +498,13 @@ async fn handle_rpc_conn(
                 registered_nodes: guard.exec.db.nodes.len(),
                 swarm_count: swarms.len(),
                 swarms,
+                nodes: guard
+                    .exec
+                    .db
+                    .nodes
+                    .iter()
+                    .map(|(pk, acc)| NodeAccountDto::from_account(pk, acc))
+                    .collect(),
             };
             write_http_json(&mut stream, 200, &status).await?;
         }
