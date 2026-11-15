@@ -15,9 +15,7 @@ use l1_state_engine::executor::{
     heartbeat_signing_bytes, sign_registration,
 };
 use l1_state_engine::shuffler::score_node;
-use l1_state_engine::state_db::{
-    NativeTransaction, RepairAuditProof, RepairEntry, MAX_SWARM_SIZE,
-};
+use l1_state_engine::state_db::{NativeTransaction, RepairAuditProof, RepairEntry, MAX_SWARM_SIZE};
 use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -122,9 +120,14 @@ pub async fn start_storage_daemon(config: StorageDaemonConfig) -> Result<Storage
     std::fs::create_dir_all(&config.data_dir)?;
     let mut slot_keys = BTreeMap::new();
     for &slot in &config.slots {
-        let key_path = config.data_dir.join("keys").join(format!("slot_{slot}.hex"));
-        let key =
-            load_or_create_signing_key(&key_path, slot_key_seed(slot, config.cluster_map.slots.len()))?;
+        let key_path = config
+            .data_dir
+            .join("keys")
+            .join(format!("slot_{slot}.hex"));
+        let key = load_or_create_signing_key(
+            &key_path,
+            slot_key_seed(slot, config.cluster_map.slots.len()),
+        )?;
         slot_keys.insert(slot, key);
     }
 
@@ -702,7 +705,9 @@ async fn execute_aggregator_cycle(
             .filter(|i| !accessible_set.contains(i))
             .map(|i| i as u8)
             .collect();
-        let needed = target.saturating_sub(accessible_before).min(target_slots.len());
+        let needed = target
+            .saturating_sub(accessible_before)
+            .min(target_slots.len());
         let parent_pool = accessible.clone();
         let m = parent_pool.len();
 
@@ -806,14 +811,11 @@ async fn execute_aggregator_cycle(
         let pa = entry.parent_slot_a as usize;
         let pb = entry.parent_slot_b as usize;
         let pr = entry.repaired_slot as usize;
-        let unchanged_slot = expected_unchanged_slot_index(
-            &epoch_seed,
-            state.swarm_id,
-            epoch,
-            &repair_log,
-            n,
-        )
-        .ok_or_else(|| Error::Network("no unchanged slot available for repair audit".into()))?;
+        let unchanged_slot =
+            expected_unchanged_slot_index(&epoch_seed, state.swarm_id, epoch, &repair_log, n)
+                .ok_or_else(|| {
+                    Error::Network("no unchanged slot available for repair audit".into())
+                })?;
         let unchanged_idx = unchanged_slot as usize;
 
         Some(RepairAuditProof {

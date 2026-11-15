@@ -188,9 +188,7 @@ fn zombie_node_generation_guard_prevents_stale_overwrite() {
     let kzg = Kzg::setup(MAX_SWARM_SIZE - 1, &mut rng);
     let fps: Vec<Scalar> = shards.iter().map(|s| s.fingerprint()).collect();
     let root = kzg.commit(&fps).unwrap();
-    let proofs: Vec<[u8; 48]> = (0..TEST_N)
-        .map(|i| kzg.open(&fps, i).unwrap())
-        .collect();
+    let proofs: Vec<[u8; 48]> = (0..TEST_N).map(|i| kzg.open(&fps, i).unwrap()).collect();
 
     let mut fsm = LazyRepairFsm::new(shards, 45, 60).unwrap();
 
@@ -221,9 +219,7 @@ fn rejects_fraudulent_root_swap_and_slashes_dishonest_aggregator_heartbeat() {
     let shards = encode(&payload, 30, TEST_N, 55).unwrap();
     let fps: Vec<Scalar> = shards.iter().map(|s| s.fingerprint()).collect();
     let root = kzg.commit(&fps).unwrap();
-    let proofs: Vec<[u8; 48]> = (0..TEST_N)
-        .map(|i| kzg.open(&fps, i).unwrap())
-        .collect();
+    let proofs: Vec<[u8; 48]> = (0..TEST_N).map(|i| kzg.open(&fps, i).unwrap()).collect();
 
     let member_root = compute_member_verkle_root(&kzg, &roster).unwrap();
     exec.init_swarm(0, roster.clone(), member_root, root, 10_000)
@@ -318,9 +314,7 @@ fn delayed_slashing_triggers_after_grace_period_and_replaces_from_standby() {
     let shards = encode(&payload, 30, TEST_N, 77).unwrap();
     let fps: Vec<Scalar> = shards.iter().map(|s| s.fingerprint()).collect();
     let root = kzg.commit(&fps).unwrap();
-    let proofs: Vec<[u8; 48]> = (0..TEST_N)
-        .map(|i| kzg.open(&fps, i).unwrap())
-        .collect();
+    let proofs: Vec<[u8; 48]> = (0..TEST_N).map(|i| kzg.open(&fps, i).unwrap()).collect();
 
     let initial_member_root = compute_member_verkle_root(&kzg, &roster).unwrap();
     exec.init_swarm(0, roster.clone(), initial_member_root, root, 20_000)

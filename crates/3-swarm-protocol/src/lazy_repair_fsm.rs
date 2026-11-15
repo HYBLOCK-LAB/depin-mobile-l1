@@ -311,9 +311,7 @@ mod tests {
         let kzg = Kzg::setup(MAX_SWARM_SIZE - 1, &mut rng);
         let fps: Vec<Scalar> = shards.iter().map(|s| s.fingerprint()).collect();
         let root = kzg.commit(&fps).unwrap();
-        let proofs: Vec<[u8; 48]> = (0..TEST_N)
-            .map(|i| kzg.open(&fps, i).unwrap())
-            .collect();
+        let proofs: Vec<[u8; 48]> = (0..TEST_N).map(|i| kzg.open(&fps, i).unwrap()).collect();
         (shards, kzg, root, proofs)
     }
 

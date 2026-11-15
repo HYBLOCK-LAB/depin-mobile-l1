@@ -69,10 +69,7 @@ pub fn shuffle(
             let s_cnt = subnet_counts.get(&node.ip_subnet_hash).copied().unwrap_or(0);
             let c_cnt = country_counts.get(&node.country_code).copied().unwrap_or(0);
 
-            if current.len() < size
-                && s_cnt < cfg.max_per_subnet
-                && c_cnt < cfg.max_per_country
-            {
+            if current.len() < size && s_cnt < cfg.max_per_subnet && c_cnt < cfg.max_per_country {
                 *subnet_counts.entry(node.ip_subnet_hash).or_insert(0) += 1;
                 *country_counts.entry(node.country_code).or_insert(0) += 1;
                 current.push(node.pubkey_p256);

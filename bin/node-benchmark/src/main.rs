@@ -100,11 +100,17 @@ fn main() {
     println!("## [Area 1] 2-verkle-fountain (F_p Linear Fountain + Lagrange KZG, 1MB Payload)");
     println!("| Metric | Value |");
     println!("| :--- | ---: |");
-    println!("| F_p Fountain Encode (k={k}, n={n}) | {:.3} ms |", encode_ms);
+    println!(
+        "| F_p Fountain Encode (k={k}, n={n}) | {:.3} ms |",
+        encode_ms
+    );
     println!("| 2-Stage Fingerprint + 48B KZG Root | {:.3} ms |", commit_ms);
     println!("| Local F_p Linear Repair (1 shard) | {:.3} ms |", repair_ms);
     println!("| Homomorphic Pollution Verification | {:.3} ms |", pollution_check_ms);
-    println!("| Gaussian-Jordan Decode ({k} shards) | {:.3} ms |\n", decode_ms);
+    println!(
+        "| Gaussian-Jordan Decode ({k} shards) | {:.3} ms |\n",
+        decode_ms
+    );
 
     // ------------------------------------------------------------------
     // 2. 온체인 상태 압축 & BFT 합의 벤치마크 (1-l1-state-engine + 3-swarm-protocol)
@@ -165,9 +171,7 @@ fn main() {
     let mut fsm = LazyRepairFsm::new(shards, t_repair, t_target).expect("fsm");
 
     // (n - T_repair)대 노드 이탈(T_repair 도달) 후 지연 복구 + 반장 승계 + BFT 체크포인트 블록 확정 측정
-    let proofs: Vec<[u8; 48]> = (0..n)
-        .map(|i| kzg.open(&fps, i).expect("open"))
-        .collect();
+    let proofs: Vec<[u8; 48]> = (0..n).map(|i| kzg.open(&fps, i).expect("open")).collect();
     for i in 0..n - t_repair {
         if i % 3 == 0 {
             let _ = fsm.drop_node(i, None); // 영구 이탈

@@ -125,9 +125,14 @@ pub fn build_checkpoint_with_bitmap(
             .open(&new_fps, pr)
             .map_err(|_| Error::CoordinatorFailed)?;
 
-        let unchanged_slot =
-            expected_unchanged_slot_index(epoch_seed, swarm_id, epoch, &repair_log, fsm.slots.len())
-                .ok_or(Error::CoordinatorFailed)?;
+        let unchanged_slot = expected_unchanged_slot_index(
+            epoch_seed,
+            swarm_id,
+            epoch,
+            &repair_log,
+            fsm.slots.len(),
+        )
+        .ok_or(Error::CoordinatorFailed)?;
         let unchanged_idx = unchanged_slot as usize;
         let unchanged_new_proof = kzg
             .open(&new_fps, unchanged_idx)
@@ -179,9 +184,9 @@ pub fn build_checkpoint_with_bitmap(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use l1_state_engine::state_db::MAX_SWARM_SIZE;
     use rand::SeedableRng;
     use rand_chacha::ChaCha8Rng;
-    use l1_state_engine::state_db::MAX_SWARM_SIZE;
     use verkle_fountain::fountain::encode;
 
     const TEST_N: usize = 100;
@@ -212,9 +217,7 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(9);
         let kzg = Kzg::setup(MAX_SWARM_SIZE - 1, &mut rng);
         let fps: Vec<Scalar> = shards.iter().map(|s| s.fingerprint()).collect();
-        let proofs: Vec<KzgProof> = (0..TEST_N)
-            .map(|i| kzg.open(&fps, i).unwrap())
-            .collect();
+        let proofs: Vec<KzgProof> = (0..TEST_N).map(|i| kzg.open(&fps, i).unwrap()).collect();
 
         let mut fsm = LazyRepairFsm::new(shards, 45, 60).unwrap();
         fsm.drop_node(0, Some(10)).unwrap();

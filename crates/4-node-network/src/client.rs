@@ -32,13 +32,15 @@ pub fn build_cluster_map(
         .into_iter()
         .zip(node_endpoints)
         .enumerate()
-        .map(|(slot, ((_, _, pk), &(node_id, p2p_addr, rpc_addr)))| SlotAssignmentDto {
-            slot: slot as u8,
-            node_id,
-            p2p_addr: p2p_addr.to_string(),
-            rpc_addr: rpc_addr.to_string(),
-            pubkey_hex: hex::encode(pk),
-        })
+        .map(
+            |(slot, ((_, _, pk), &(node_id, p2p_addr, rpc_addr)))| SlotAssignmentDto {
+                slot: slot as u8,
+                node_id,
+                p2p_addr: p2p_addr.to_string(),
+                rpc_addr: rpc_addr.to_string(),
+                pubkey_hex: hex::encode(pk),
+            },
+        )
         .collect();
     Ok(SwarmClusterMapDto {
         swarm_id,
@@ -97,7 +99,9 @@ pub async fn upload_payload(
                 .swarms
                 .iter()
                 .find(|s| s.swarm_id == target_swarm_id)
-                .unwrap_or_else(|| &status.swarms[(target_swarm_id as usize) % status.swarms.len()]),
+                .unwrap_or_else(|| {
+                    &status.swarms[(target_swarm_id as usize) % status.swarms.len()]
+                }),
         )
     };
     let roster_pubkeys_hex: Vec<String> = match target_swarm {
@@ -116,7 +120,14 @@ pub async fn upload_payload(
     let n = roster_pubkeys_hex.len();
     let uptime_sum: u64 = roster_pubkeys_hex
         .iter()
-        .map(|pk| u64::from(ema_by_pubkey.get(pk.as_str()).copied().unwrap_or(DEFAULT_UPTIME_BPS)))
+        .map(|pk| {
+            u64::from(
+                ema_by_pubkey
+                    .get(pk.as_str())
+                    .copied()
+                    .unwrap_or(DEFAULT_UPTIME_BPS),
+            )
+        })
         .sum();
     let params = swarm_params(n, (uptime_sum / n.max(1) as u64) as u16)?;
 

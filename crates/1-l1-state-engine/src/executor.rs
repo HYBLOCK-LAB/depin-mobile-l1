@@ -1,9 +1,9 @@
+use crate::shuffler::swarm_params;
 use crate::state_db::{
     compute_member_verkle_root, open_member_verkle_proof, verify_member_verkle_proof,
     EnshrinedSwarmDB, NativeTransaction, NodeAccount, VirtualSwarmState, DEFAULT_UPTIME_BPS,
     MAX_SWARM_SIZE, MIN_SWARM_SIZE,
 };
-use crate::shuffler::swarm_params;
 use crate::{Error, Result};
 use p256::ecdsa::{
     signature::{Signer, Verifier},
@@ -503,13 +503,9 @@ impl Executor {
                     }
 
                     // 3d. 비-복구 슬롯 무결성 검증: VRF로 지목된 미복구 슬롯이 old/new 루트에서 동일하게 유지되는지 확인
-                    if let Some(expected_unchanged) = expected_unchanged_slot_index(
-                        epoch_seed,
-                        swarm_id,
-                        epoch,
-                        &repair_log,
-                        n,
-                    ) {
+                    if let Some(expected_unchanged) =
+                        expected_unchanged_slot_index(epoch_seed, swarm_id, epoch, &repair_log, n)
+                    {
                         if audit.unchanged_slot != expected_unchanged
                             || repair_log
                                 .iter()
@@ -747,7 +743,9 @@ mod tests {
         setup_swarm_executor_n(TEST_N)
     }
 
-    fn setup_swarm_executor_n(n: usize) -> (
+    fn setup_swarm_executor_n(
+        n: usize,
+    ) -> (
         Executor,
         Kzg,
         Vec<SigningKey>,
@@ -1545,12 +1543,16 @@ mod tests {
     fn checkpoint_updates_ema_uptime_for_online_and_offline_nodes() {
         let (mut exec, kzg, keys, roster, fps, root, epoch_seed) = setup_swarm_executor();
         let bitmap = ((1u128 << TEST_N) - 1) & !(1u128 << 5);
-        let ckpt = build_signed_checkpoint(0, 1, 0, &keys[0], &kzg, &fps, root, bitmap, &epoch_seed);
+        let ckpt =
+            build_signed_checkpoint(0, 1, 0, &keys[0], &kzg, &fps, root, bitmap, &epoch_seed);
         exec.execute(ckpt, &kzg, &epoch_seed).unwrap();
 
         let online = exec.db.nodes[&roster[0]].ema_uptime_bps;
         let offline = exec.db.nodes[&roster[5]].ema_uptime_bps;
-        assert_eq!(online, DEFAULT_UPTIME_BPS + (10_000 - DEFAULT_UPTIME_BPS) / 8);
+        assert_eq!(
+            online,
+            DEFAULT_UPTIME_BPS + (10_000 - DEFAULT_UPTIME_BPS) / 8
+        );
         assert_eq!(offline, DEFAULT_UPTIME_BPS - DEFAULT_UPTIME_BPS / 8);
     }
 
@@ -1566,7 +1568,15 @@ mod tests {
         let (mut small, kzg, keys, _roster, fps, root, epoch_seed) = setup_swarm_executor();
         let out_of_range = (1u128 << TEST_N) | 1;
         let ckpt = build_signed_checkpoint(
-            0, 1, 0, &keys[0], &kzg, &fps, root, out_of_range, &epoch_seed,
+            0,
+            1,
+            0,
+            &keys[0],
+            &kzg,
+            &fps,
+            root,
+            out_of_range,
+            &epoch_seed,
         );
         assert!(matches!(
             small.execute(ckpt, &kzg, &epoch_seed),
