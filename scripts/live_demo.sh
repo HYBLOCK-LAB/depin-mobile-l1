@@ -96,7 +96,7 @@ for nid in $(seq 0 9); do
   wait_health "http://127.0.0.1:$((19300 + nid))"
 done
 
-"$CLI_BIN" register-all --cluster-map "$CLUSTER_MAP"
+"$CLI_BIN" register-all --l1-rpc "http://127.0.0.1:19110" --cluster-map "$CLUSTER_MAP"
 
 echo "[4/8] Generating 64KB sample file and uploading 10 F_p shards over TCP..."
 dd if=/dev/urandom of="$DEMO_DIR/sample.bin" bs=1024 count=64 2>/dev/null
@@ -138,6 +138,7 @@ wait_health "http://127.0.0.1:19110"
 
 echo "[8/8] Downloading & decoding from 4 surviving nodes over TCP and checking SHA-256..."
 "$CLI_BIN" download \
+  --l1-rpc "http://127.0.0.1:19110" \
   --cluster-map "$CLUSTER_MAP" \
   --object-id "$OBJECT_ID" \
   --node-rpc "http://127.0.0.1:19306" \

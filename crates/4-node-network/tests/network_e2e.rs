@@ -107,11 +107,11 @@ fn distributed_bft_lazy_repair_crash_recovery_and_download_e2e() {
             let handle = start_storage_daemon(StorageDaemonConfig {
                 node_id: *node_id,
                 slots,
-                swarm_id: 0,
                 p2p_addr: *p2p_addr,
                 rpc_addr: *rpc_addr,
                 l1_rpc_url: validators[0].rpc_url.clone(),
-                cluster_map: cluster_map.clone(),
+                cluster_map: Some(cluster_map.clone()),
+                auto_register: None,
                 data_dir: tmp.path.join(format!("storage_{node_id}")),
                 ip_subnet_hash: *node_id as u16,
                 country_code: (*node_id % 8) as u8,
@@ -153,7 +153,7 @@ fn distributed_bft_lazy_repair_crash_recovery_and_download_e2e() {
         let payload: Vec<u8> = (0..12_345).map(|i| ((i * 29 + 7) % 253) as u8).collect();
         let (manifest, init_block) = upload_payload(
             &validators[0].rpc_url,
-            &cluster_map,
+            Some(&cluster_map),
             &kzg,
             &payload,
             5_000,
@@ -277,7 +277,8 @@ fn distributed_bft_lazy_repair_crash_recovery_and_download_e2e() {
 
         // 6. 살아있는 4대 노드(6개 접근 가능 조각 = 4 원본 + 2 복구 조각)에서 실제 TCP로 받아 원본 100% 복원
         let (decoded, collected) = download_payload(
-            &cluster_map,
+            &validators[0].rpc_url,
+            Some(&cluster_map),
             &manifest.object_id_hex,
             Some(&storage_nodes[1].rpc_url),
         )
@@ -345,11 +346,11 @@ fn p2p_heartbeat_receipt_fault_proof_and_custodian_handoff_e2e() {
             let handle = start_storage_daemon(StorageDaemonConfig {
                 node_id: *node_id,
                 slots,
-                swarm_id: 0,
                 p2p_addr: *p2p_addr,
                 rpc_addr: *rpc_addr,
                 l1_rpc_url: validators[0].rpc_url.clone(),
-                cluster_map: cluster_map.clone(),
+                cluster_map: Some(cluster_map.clone()),
+                auto_register: None,
                 data_dir: tmp.path.join(format!("storage_{node_id}")),
                 ip_subnet_hash: *node_id as u16,
                 country_code: (*node_id % 8) as u8,
@@ -374,7 +375,7 @@ fn p2p_heartbeat_receipt_fault_proof_and_custodian_handoff_e2e() {
         let payload: Vec<u8> = (0..8_192).map(|i| ((i * 17 + 5) % 251) as u8).collect();
         let (manifest, _) = upload_payload(
             &validators[0].rpc_url,
-            &cluster_map,
+            Some(&cluster_map),
             &kzg,
             &payload,
             10_000,
@@ -552,11 +553,11 @@ fn p2p_heartbeat_receipt_fault_proof_and_custodian_handoff_e2e() {
         let standby = start_storage_daemon(StorageDaemonConfig {
             node_id: 10,
             slots: vec![0],
-            swarm_id: 0,
             p2p_addr: reserve_addr(),
             rpc_addr: reserve_addr(),
             l1_rpc_url: validators[0].rpc_url.clone(),
-            cluster_map,
+            cluster_map: Some(cluster_map),
+            auto_register: None,
             data_dir: tmp.path.join("standby_10"),
             ip_subnet_hash: NODE_COUNT as u16,
             country_code: 2,
@@ -681,11 +682,11 @@ fn auto_shuffle_zero_tx_routing_and_multifile_upload_download_e2e() {
             let handle = start_storage_daemon(StorageDaemonConfig {
                 node_id: *node_id,
                 slots,
-                swarm_id: 0,
                 p2p_addr: *p2p_addr,
                 rpc_addr: *rpc_addr,
                 l1_rpc_url: validators[0].rpc_url.clone(),
-                cluster_map: cluster_map.clone(),
+                cluster_map: Some(cluster_map.clone()),
+                auto_register: None,
                 data_dir: tmp.path.join(format!("storage_{node_id}")),
                 ip_subnet_hash: *node_id as u16,
                 country_code: (*node_id % 8) as u8,
@@ -729,7 +730,7 @@ fn auto_shuffle_zero_tx_routing_and_multifile_upload_download_e2e() {
 
         let (manifest_a, block_a) = upload_payload(
             &validators[0].rpc_url,
-            &cluster_map,
+            Some(&cluster_map),
             &kzg,
             &payload_a,
             0,
@@ -742,7 +743,7 @@ fn auto_shuffle_zero_tx_routing_and_multifile_upload_download_e2e() {
 
         let (manifest_b, block_b) = upload_payload(
             &validators[0].rpc_url,
-            &cluster_map,
+            Some(&cluster_map),
             &kzg,
             &payload_b,
             0,
@@ -762,7 +763,8 @@ fn auto_shuffle_zero_tx_routing_and_multifile_upload_download_e2e() {
 
         // 3. 두 번째 파일 업로드 후에도 파일 A와 파일 B 모두 개별 매니페스트 조회로 100% 복원
         let (decoded_a, count_a) = download_payload(
-            &cluster_map,
+            &validators[0].rpc_url,
+            Some(&cluster_map),
             &manifest_a.object_id_hex,
             Some(&storage_nodes[0].rpc_url),
         )
@@ -772,7 +774,8 @@ fn auto_shuffle_zero_tx_routing_and_multifile_upload_download_e2e() {
         assert_eq!(decoded_a, payload_a);
 
         let (decoded_b, count_b) = download_payload(
-            &cluster_map,
+            &validators[0].rpc_url,
+            Some(&cluster_map),
             &manifest_b.object_id_hex,
             Some(&storage_nodes[0].rpc_url),
         )
@@ -809,7 +812,8 @@ fn auto_shuffle_zero_tx_routing_and_multifile_upload_download_e2e() {
         );
 
         let (decoded_a_after, _) = download_payload(
-            &cluster_map,
+            &validators[0].rpc_url,
+            Some(&cluster_map),
             &manifest_a.object_id_hex,
             Some(&storage_nodes[0].rpc_url),
         )
@@ -818,7 +822,8 @@ fn auto_shuffle_zero_tx_routing_and_multifile_upload_download_e2e() {
         assert_eq!(decoded_a_after, payload_a);
 
         let (decoded_b_after, _) = download_payload(
-            &cluster_map,
+            &validators[0].rpc_url,
+            Some(&cluster_map),
             &manifest_b.object_id_hex,
             Some(&storage_nodes[0].rpc_url),
         )
@@ -891,11 +896,11 @@ fn batch_registration_16_nodes_forms_adaptive_14_node_swarm_and_repairs_e2e() {
             let handle = start_storage_daemon(StorageDaemonConfig {
                 node_id: *node_id,
                 slots,
-                swarm_id: 0,
                 p2p_addr: *p2p_addr,
                 rpc_addr: *rpc_addr,
                 l1_rpc_url: validators[0].rpc_url.clone(),
-                cluster_map: cluster_map.clone(),
+                cluster_map: Some(cluster_map.clone()),
+                auto_register: None,
                 data_dir: tmp.path.join(format!("storage_{node_id}")),
                 ip_subnet_hash: *node_id as u16,
                 country_code: (*node_id % 8) as u8,
@@ -929,6 +934,7 @@ fn batch_registration_16_nodes_forms_adaptive_14_node_swarm_and_repairs_e2e() {
         assert_eq!(swarm.state.lazy_repair_trigger, expected_params.t_repair);
         assert_eq!(swarm.state.lazy_repair_target, expected_params.t_target);
         assert_eq!(swarm.roster_pubkeys_hex.len(), expected_n);
+        assert_eq!(status.registered_nodes - swarm.roster_pubkeys_hex.len(), 2);
 
         // Verify Ping with target_map_slot signs Pong & persists inline receipt under the L1 slot.
         let slot_by_pubkey: BTreeMap<&str, &node_network::wire::SlotAssignmentDto> = cluster_map
@@ -982,7 +988,7 @@ fn batch_registration_16_nodes_forms_adaptive_14_node_swarm_and_repairs_e2e() {
         let payload: Vec<u8> = (0..9_000).map(|i| ((i * 23 + 11) % 251) as u8).collect();
         let (manifest, deposit_block) = upload_payload(
             &validators[0].rpc_url,
-            &cluster_map,
+            Some(&cluster_map),
             &kzg,
             &payload,
             5_000,
@@ -1024,7 +1030,8 @@ fn batch_registration_16_nodes_forms_adaptive_14_node_swarm_and_repairs_e2e() {
         assert_eq!(report.block_height, 3);
 
         let (decoded, collected) = download_payload(
-            &cluster_map,
+            &validators[0].rpc_url,
+            Some(&cluster_map),
             &manifest.object_id_hex,
             Some(&successor_rpc),
         )

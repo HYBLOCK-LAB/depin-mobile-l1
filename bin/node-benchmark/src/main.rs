@@ -124,7 +124,15 @@ fn main() {
         let sk = deterministic_signing_key(i);
         let ip_subnet = (i / 2) as u16;
         let country = (i % 10) as u8;
-        let (pk, sig) = sign_registration(&sk, exec.config.chain_id, ip_subnet, country, 2_000);
+        let (pk, sig) = sign_registration(
+            &sk,
+            exec.config.chain_id,
+            ip_subnet,
+            country,
+            2_000,
+            "127.0.0.1:9000",
+            "127.0.0.1:9001",
+        );
         descriptors.push(NodeDescriptor {
             pubkey_p256: pk,
             ip_subnet_hash: ip_subnet,
@@ -136,6 +144,8 @@ fn main() {
             ip_subnet_hash: ip_subnet,
             country_code: country,
             stake: 2_000,
+            p2p_addr: "127.0.0.1:9000".into(),
+            rpc_addr: "127.0.0.1:9001".into(),
         });
         node_keys.push(sk);
     }
