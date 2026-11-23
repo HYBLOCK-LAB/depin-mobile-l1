@@ -386,7 +386,10 @@ async fn handoff_shard(
         return Ok(ack(false, "custodian shard not found".into()));
     };
     let Ok(target_addr) = target_p2p_addr.parse::<SocketAddr>() else {
-        return Ok(ack(false, format!("invalid target_p2p_addr: {target_p2p_addr}")));
+        return Ok(ack(
+            false,
+            format!("invalid target_p2p_addr: {target_p2p_addr}"),
+        ));
     };
     let reply = send_p2p(
         target_addr,
@@ -747,9 +750,16 @@ fn plan_handoffs(
         .collect()
 }
 
-async fn handoff_to_replaced_nodes(state: &StorageRuntimeState, status: &L1StatusDto) -> Result<()> {
+async fn handoff_to_replaced_nodes(
+    state: &StorageRuntimeState,
+    status: &L1StatusDto,
+) -> Result<()> {
     for mut manifest in NodeStorage::list_manifests(&state.data_dir)? {
-        let Some(swarm) = status.swarms.iter().find(|s| s.swarm_id == manifest.swarm_id) else {
+        let Some(swarm) = status
+            .swarms
+            .iter()
+            .find(|s| s.swarm_id == manifest.swarm_id)
+        else {
             continue;
         };
         let hosted_slots: BTreeSet<u8> = state
@@ -763,7 +773,11 @@ async fn handoff_to_replaced_nodes(state: &StorageRuntimeState, status: &L1Statu
         if slots.is_empty() {
             continue;
         }
-        let roster = resolve_roster(status, &swarm.roster_pubkeys_hex, state.cluster_map.as_ref())?;
+        let roster = resolve_roster(
+            status,
+            &swarm.roster_pubkeys_hex,
+            state.cluster_map.as_ref(),
+        )?;
         let mut changed = false;
         for slot in slots {
             let target = roster[slot as usize].p2p_addr.to_string();
@@ -819,10 +833,7 @@ async fn submit_pending_fault_proofs(
     Ok(())
 }
 
-async fn run_epoch_if_aggregator(
-    state: &StorageRuntimeState,
-    status: &L1StatusDto,
-) -> Result<()> {
+async fn run_epoch_if_aggregator(state: &StorageRuntimeState, status: &L1StatusDto) -> Result<()> {
     let (swarm_id, local_slot) = state
         .identities
         .iter()
@@ -836,7 +847,11 @@ async fn run_epoch_if_aggregator(
         .find(|s| s.swarm_id == swarm_id)
         .ok_or_else(|| Error::Network("swarm missing on L1".into()))?;
     let epoch = swarm.state.last_epoch_settled + 1;
-    let roster = resolve_roster(status, &swarm.roster_pubkeys_hex, state.cluster_map.as_ref())?;
+    let roster = resolve_roster(
+        status,
+        &swarm.roster_pubkeys_hex,
+        state.cluster_map.as_ref(),
+    )?;
     let online_slots = ping_all_slots(&roster, local_slot, epoch).await?;
     let is_aggregator = online_slots
         .iter()
@@ -866,7 +881,10 @@ async fn auto_epoch_loop(state: Arc<StorageRuntimeState>, interval: Duration) {
         let status = match fetch_l1_status(&state.l1_rpc_url).await {
             Ok(status) => status,
             Err(e) => {
-                eprintln!("auto epoch: node {} status fetch failed: {e}", state.node_id);
+                eprintln!(
+                    "auto epoch: node {} status fetch failed: {e}",
+                    state.node_id
+                );
                 continue;
             }
         };
@@ -876,7 +894,10 @@ async fn auto_epoch_loop(state: Arc<StorageRuntimeState>, interval: Duration) {
                 submit_pending_fault_proofs(&state, &status, &mut submitted_fault_proofs).await,
             ),
             ("handoff", handoff_to_replaced_nodes(&state, &status).await),
-            ("epoch cycle", run_epoch_if_aggregator(&state, &status).await),
+            (
+                "epoch cycle",
+                run_epoch_if_aggregator(&state, &status).await,
+            ),
         ];
         for (step, result) in results {
             if let Err(e) = result {
@@ -1173,7 +1194,9 @@ async fn execute_aggregator_cycle(
 
     broadcast_manifest(
         &manifest,
-        online_slots.iter().map(|&slot| roster[slot as usize].p2p_addr),
+        online_slots
+            .iter()
+            .map(|&slot| roster[slot as usize].p2p_addr),
     )
     .await;
 

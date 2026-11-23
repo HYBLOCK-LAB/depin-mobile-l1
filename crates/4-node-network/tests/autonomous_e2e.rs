@@ -43,7 +43,8 @@ impl TempDirGuard {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("time")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("depin_{name}_{}_{nanos}", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("depin_{name}_{}_{nanos}", std::process::id()));
         std::fs::create_dir_all(&path).expect("create temp dir");
         Self { path }
     }
@@ -175,9 +176,16 @@ fn auto_epoch_loop_succeeds_aggregator_without_manual_run_cycle_e2e() {
             .expect("register all nodes");
 
         let payload: Vec<u8> = (0..8_192).map(|i| ((i * 13 + 7) % 251) as u8).collect();
-        upload_payload(&l1_rpc, Some(&cluster_map), &client_kzg(&tmp), &payload, 10_000, 311)
-            .await
-            .expect("upload payload");
+        upload_payload(
+            &l1_rpc,
+            Some(&cluster_map),
+            &client_kzg(&tmp),
+            &payload,
+            10_000,
+            311,
+        )
+        .await
+        .expect("upload payload");
 
         let status = wait_for_status(&l1_rpc, "two epochs settled by slot 0", |s| {
             s.swarms[0].state.last_epoch_settled >= 2 && latest_aggregator_slot(s) == Some(0)
@@ -219,20 +227,25 @@ fn victim_node_auto_submits_fault_proof_against_forged_attendance_e2e() {
         let tmp = TempDirGuard::new("auto_fault_proof");
         let validators = start_validators(&tmp, DEFAULT_EPOCH_SEED).await;
         let l1_rpc = validators[0].rpc_url.clone();
-        let (cluster_map, nodes) =
-            start_storage_nodes(&tmp, &l1_rpc, NODE_COUNT, |node_id| {
-                (node_id != 0).then_some(AUTO_EPOCH)
-            })
-            .await;
+        let (cluster_map, nodes) = start_storage_nodes(&tmp, &l1_rpc, NODE_COUNT, |node_id| {
+            (node_id != 0).then_some(AUTO_EPOCH)
+        })
+        .await;
         register_cluster_via_nodes(&cluster_map)
             .await
             .expect("register all nodes");
 
         let payload: Vec<u8> = (0..8_192).map(|i| ((i * 17 + 5) % 251) as u8).collect();
-        let (manifest, _) =
-            upload_payload(&l1_rpc, Some(&cluster_map), &client_kzg(&tmp), &payload, 10_000, 902)
-                .await
-                .expect("upload payload");
+        let (manifest, _) = upload_payload(
+            &l1_rpc,
+            Some(&cluster_map),
+            &client_kzg(&tmp),
+            &payload,
+            10_000,
+            902,
+        )
+        .await
+        .expect("upload payload");
 
         let agg_key = deterministic_signing_key(slot_key_seed(0, NODE_COUNT));
         let receipt_sig: Signature = agg_key.sign(&heartbeat_signing_bytes(0, 1, 1));
@@ -249,7 +262,10 @@ fn victim_node_auto_submits_fault_proof_against_forged_attendance_e2e() {
         )
         .await
         .expect("issue receipt");
-        assert!(matches!(receipt_reply, node_network::wire::P2pResponse::Ack { ok: true }));
+        assert!(matches!(
+            receipt_reply,
+            node_network::wire::P2pResponse::Ack { ok: true }
+        ));
 
         let status = l1_status(&l1_rpc).await;
         let epoch_seed = decode_fixed_hex::<32>(&status.epoch_seed_hex).expect("epoch seed");
@@ -258,7 +274,8 @@ fn victim_node_auto_submits_fault_proof_against_forged_attendance_e2e() {
         let sample_eval =
             decode_fixed_hex::<32>(&manifest.slot_fps_hex[sample_index as usize]).expect("eval");
         let kzg_sample_proof =
-            decode_fixed_hex::<48>(&manifest.slot_proofs_hex[sample_index as usize]).expect("proof");
+            decode_fixed_hex::<48>(&manifest.slot_proofs_hex[sample_index as usize])
+                .expect("proof");
         let forged_bitmap = ((1u128 << NODE_COUNT) - 1) & !(1u128 << 1);
         let ckpt_sig: Signature = agg_key.sign(&NativeTransaction::checkpoint_signing_bytes(
             0,
@@ -293,10 +310,14 @@ fn victim_node_auto_submits_fault_proof_against_forged_attendance_e2e() {
             repair_audit: None,
             aggregator_p256_sig: ckpt_sig.to_bytes().into(),
         };
-        let _: FinalizedBlockDto =
-            http_request_json(&l1_rpc, "POST", "/tx/submit", Some(&TxDto::from_native(&forged)))
-                .await
-                .expect("submit forged checkpoint");
+        let _: FinalizedBlockDto = http_request_json(
+            &l1_rpc,
+            "POST",
+            "/tx/submit",
+            Some(&TxDto::from_native(&forged)),
+        )
+        .await
+        .expect("submit forged checkpoint");
 
         let status = wait_for_status(&l1_rpc, "aggregator stake slashed by fault proof", |s| {
             stake_of(s) < stake_before
@@ -340,10 +361,16 @@ fn custodian_auto_hands_off_shards_to_standby_nodes_after_slashing_e2e() {
         assert_eq!(initial_roster.len(), n);
 
         let payload: Vec<u8> = (0..9_000).map(|i| ((i * 23 + 11) % 251) as u8).collect();
-        let (manifest, _) =
-            upload_payload(&l1_rpc, Some(&cluster_map), &client_kzg(&tmp), &payload, 5_000, 777)
-                .await
-                .expect("upload payload");
+        let (manifest, _) = upload_payload(
+            &l1_rpc,
+            Some(&cluster_map),
+            &client_kzg(&tmp),
+            &payload,
+            5_000,
+            777,
+        )
+        .await
+        .expect("upload payload");
 
         let node_id_of: BTreeMap<String, u64> = cluster_map
             .slots
@@ -354,20 +381,26 @@ fn custodian_auto_hands_off_shards_to_standby_nodes_after_slashing_e2e() {
         let mut live: BTreeMap<u64, StorageDaemonHandle> =
             nodes.into_iter().map(|h| (h.node_id, h)).collect();
         for pubkey in &initial_roster[..down_count] {
-            live.remove(&node_id_of[pubkey]).expect("roster node").shutdown().await;
+            live.remove(&node_id_of[pubkey])
+                .expect("roster node")
+                .shutdown()
+                .await;
         }
 
         let handed_off = (params.t_target - params.t_repair) as usize;
         let handed_off = handed_off.min(STANDBY_COUNT);
         let status = wait_for_status(&l1_rpc, "standby nodes to replace slashed slots", |s| {
-            (0..STANDBY_COUNT).all(|slot| s.swarms[0].roster_pubkeys_hex[slot] != initial_roster[slot])
+            (0..STANDBY_COUNT)
+                .all(|slot| s.swarms[0].roster_pubkeys_hex[slot] != initial_roster[slot])
         })
         .await;
         let new_roster = status.swarms[0].roster_pubkeys_hex.clone();
 
         let deadline = Instant::now() + WAIT_TIMEOUT;
         for slot in 0..handed_off {
-            let dir = tmp.path.join(format!("storage_{}", node_id_of[&new_roster[slot]]));
+            let dir = tmp
+                .path
+                .join(format!("storage_{}", node_id_of[&new_roster[slot]]));
             while NodeStorage::load_shard_by_role(&dir, slot as u8, false, &manifest.object_id_hex)
                 .expect("load handed-off shard")
                 .is_none()

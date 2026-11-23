@@ -421,7 +421,13 @@ pub async fn submit_native_tx(
     l1_rpc_url: &str,
     tx: &NativeTransaction,
 ) -> Result<FinalizedBlockDto> {
-    http_request_json(l1_rpc_url, "POST", "/tx/submit", Some(&TxDto::from_native(tx))).await
+    http_request_json(
+        l1_rpc_url,
+        "POST",
+        "/tx/submit",
+        Some(&TxDto::from_native(tx)),
+    )
+    .await
 }
 
 pub fn fault_proof_txs(
@@ -472,7 +478,9 @@ pub async fn request_handoff(
         .await
         .ok_or_else(|| Error::Network(format!("manifest for object {object_id_hex} not found")))?;
     let custodian_slot = *manifest.custodian_owners.get(&slot).ok_or_else(|| {
-        Error::Network(format!("slot {slot} has no custodian for object {object_id_hex}"))
+        Error::Network(format!(
+            "slot {slot} has no custodian for object {object_id_hex}"
+        ))
     })?;
     let swarm = status
         .swarms
@@ -531,14 +539,20 @@ mod tests {
 
     #[test]
     fn fault_proof_txs_select_only_zero_bit_settlements_with_matching_receipt() {
-        let dir = std::env::temp_dir().join(format!("depin_fault_proof_txs_{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("depin_fault_proof_txs_{}", std::process::id()));
         let sig_hex = "11".repeat(64);
         NodeStorage::save_heartbeat_receipt(&dir, 0, 1, 2, 0, &sig_hex).unwrap();
         NodeStorage::save_heartbeat_receipt(&dir, 0, 2, 2, 0, &sig_hex).unwrap();
         NodeStorage::save_heartbeat_receipt(&dir, 0, 3, 2, 5, &sig_hex).unwrap();
 
         let txs = fault_proof_txs(
-            &swarm(vec![(1, 0, 0b011), (2, 0, 0b111), (3, 0, 0b011), (4, 0, 0b011)]),
+            &swarm(vec![
+                (1, 0, 0b011),
+                (2, 0, 0b111),
+                (3, 0, 0b011),
+                (4, 0, 0b011),
+            ]),
             2,
             &dir,
         )
