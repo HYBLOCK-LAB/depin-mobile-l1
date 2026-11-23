@@ -44,10 +44,10 @@ enum Command {
         cluster_map: PathBuf,
         #[arg(long)]
         data_dir: PathBuf,
-        #[arg(long, default_value_t = 45)]
-        trigger: usize,
-        #[arg(long, default_value_t = 60)]
-        target: usize,
+        #[arg(long)]
+        ip_subnet_hash: u16,
+        #[arg(long)]
+        country_code: u8,
     },
 }
 
@@ -102,8 +102,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 l1_rpc,
                 cluster_map,
                 data_dir,
-                trigger,
-                target,
+                ip_subnet_hash,
+                country_code,
             } => {
                 let map_bytes = std::fs::read(&cluster_map)?;
                 let map: SwarmClusterMapDto = serde_json::from_slice(&map_bytes)?;
@@ -118,8 +118,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     l1_rpc_url: l1_rpc,
                     cluster_map: map,
                     data_dir,
-                    trigger,
-                    target,
+                    ip_subnet_hash,
+                    country_code,
                     kzg_seed: DEFAULT_KZG_SEED,
                 })
                 .await?;

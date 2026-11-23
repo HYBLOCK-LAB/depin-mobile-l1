@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use l1_state_engine::state_db::SWARM_SIZE;
+use l1_state_engine::state_db::MAX_SWARM_SIZE;
 use node_network::client::{
     build_cluster_map, download_payload, register_cluster_via_nodes, upload_payload,
 };
@@ -143,7 +143,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let payload = std::fs::read(&file)?;
                 let kzg = ValidatorStorage::load_or_create_kzg(
                     &kzg_cache_dir,
-                    SWARM_SIZE - 1,
+                    MAX_SWARM_SIZE - 1,
                     DEFAULT_KZG_SEED,
                 )?;
                 let (manifest, maybe_block) =

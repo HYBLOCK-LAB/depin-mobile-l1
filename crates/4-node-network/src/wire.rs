@@ -356,6 +356,7 @@ pub struct NodeAccountDto {
     pub reward_balance: u128,
     pub consecutive_offline_epochs: u32,
     pub slashed: bool,
+    pub ema_uptime_bps: u16,
 }
 
 impl NodeAccountDto {
@@ -368,6 +369,7 @@ impl NodeAccountDto {
             reward_balance: acc.reward_balance,
             consecutive_offline_epochs: acc.consecutive_offline_epochs,
             slashed: acc.slashed,
+            ema_uptime_bps: acc.ema_uptime_bps,
         }
     }
 
@@ -383,6 +385,7 @@ impl NodeAccountDto {
                 reward_balance: self.reward_balance,
                 consecutive_offline_epochs: self.consecutive_offline_epochs,
                 slashed: self.slashed,
+                ema_uptime_bps: self.ema_uptime_bps,
             },
         ))
     }
@@ -540,6 +543,7 @@ pub struct L1StatusDto {
     pub registered_nodes: usize,
     pub swarm_count: usize,
     pub swarms: Vec<SwarmSummaryDto>,
+    pub nodes: Vec<NodeAccountDto>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -563,6 +567,8 @@ pub struct SwarmManifestDto {
     pub swarm_id: u64,
     pub object_id_hex: String,
     pub root_hex: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roster_pubkeys_hex: Vec<String>,
     pub slot_fps_hex: Vec<String>,
     pub slot_proofs_hex: Vec<String>,
     #[serde(default)]
@@ -598,6 +604,8 @@ pub enum P2pRequest {
         swarm_id: u64,
         epoch: u64,
         target_slot: u8,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_map_slot: Option<u8>,
         aggregator_slot: u8,
         sig_hex: String,
     },
@@ -1081,6 +1089,7 @@ mod tests {
             swarm_id: 1,
             epoch: 4,
             target_slot: 9,
+            target_map_slot: None,
             aggregator_slot: 0,
             sig_hex: "aa".repeat(64),
         };

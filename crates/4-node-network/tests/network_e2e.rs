@@ -1,5 +1,5 @@
 use l1_state_engine::executor::{expected_sample_index, heartbeat_signing_bytes};
-use l1_state_engine::state_db::{compute_member_verkle_root, NativeTransaction, SWARM_SIZE};
+use l1_state_engine::state_db::{compute_member_verkle_root, NativeTransaction, MAX_SWARM_SIZE};
 use node_network::client::{
     build_cluster_map, download_payload, register_cluster_via_nodes, slots_for_node, upload_payload,
 };
@@ -16,6 +16,12 @@ use p256::ecdsa::{signature::Signer, Signature};
 use serde::Serialize;
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
+
+const NODE_COUNT: usize = 10;
+const K: usize = 2;
+const T_REPAIR: usize = 4;
+const T_TARGET: usize = 6;
+const DOWN_NODES: usize = NODE_COUNT - T_REPAIR;
 
 fn reserve_addr() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").expect("ephemeral bind");
@@ -51,6 +57,8 @@ struct RunCycleReq {
 
 #[test]
 fn distributed_bft_lazy_repair_crash_recovery_and_download_e2e() {
+    const REGISTERED_COUNT: usize = NODE_COUNT + 1;
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -86,7 +94,7 @@ fn distributed_bft_lazy_repair_crash_recovery_and_download_e2e() {
             validators.push(handle);
         }
 
-        let node_endpoints: Vec<(u64, SocketAddr, SocketAddr)> = (0..10u64)
+        let node_endpoints: Vec<(u64, SocketAddr, SocketAddr)> = (0..REGISTERED_COUNT as u64)
             .map(|id| (id, reserve_addr(), reserve_addr()))
             .collect();
         let cluster_map =
@@ -104,8 +112,8 @@ fn distributed_bft_lazy_repair_crash_recovery_and_download_e2e() {
                 l1_rpc_url: validators[0].rpc_url.clone(),
                 cluster_map: cluster_map.clone(),
                 data_dir: tmp.path.join(format!("storage_{node_id}")),
-                trigger: 45,
-                target: 60,
+                ip_subnet_hash: *node_id as u16,
+                country_code: (*node_id % 8) as u8,
                 kzg_seed: DEFAULT_KZG_SEED,
             })
             .await
@@ -113,30 +121,31 @@ fn distributed_bft_lazy_repair_crash_recovery_and_download_e2e() {
             storage_nodes.push(handle);
         }
 
-        // 1. 10개 스토리지 노드가 각각 자신의 10개 슬롯 P-256 키로 서명하여 L1 BFT에 등록
-        let reg_count = register_cluster_via_nodes(&cluster_map)
+        // Register map slot 0 last so it stays on standby and L1 slots differ from map slots.
+        let mut registration_map = cluster_map.clone();
+        registration_map.slots.rotate_left(1);
+        let reg_count = register_cluster_via_nodes(&registration_map)
             .await
             .expect("register all nodes");
-        assert_eq!(reg_count, SWARM_SIZE);
+        assert_eq!(reg_count, REGISTERED_COUNT);
 
         let status_after_reg: L1StatusDto =
             http_request_json::<(), L1StatusDto>(&validators[2].rpc_url, "GET", "/status", None)
                 .await
                 .expect("status on follower validator");
-        assert_eq!(status_after_reg.registered_nodes, SWARM_SIZE);
-        assert_eq!(status_after_reg.height, 10);
+        assert_eq!(status_after_reg.registered_nodes, REGISTERED_COUNT);
+        assert_eq!(status_after_reg.height, REGISTERED_COUNT as u64);
         assert_eq!(status_after_reg.swarm_count, 1);
-        let expected_roster: Vec<String> = cluster_map
-            .slots
+        let expected_roster: Vec<String> = cluster_map.slots[1..]
             .iter()
             .map(|s| s.pubkey_hex.clone())
             .collect();
         assert_eq!(status_after_reg.swarms[0].roster_pubkeys_hex, expected_roster);
 
-        // 2. 원본 파일 인코딩, Zero-Tx 라우팅(+바운티 예치), 100조각 실제 TCP P2P 분산 업로드
+        // 2. 원본 파일 인코딩, Zero-Tx 라우팅(+바운티 예치), 10조각 실제 TCP P2P 분산 업로드
         let kzg = ValidatorStorage::load_or_create_kzg(
             &tmp.path.join("client_kzg"),
-            SWARM_SIZE - 1,
+            MAX_SWARM_SIZE - 1,
             DEFAULT_KZG_SEED,
         )
         .expect("client kzg");
@@ -152,27 +161,25 @@ fn distributed_bft_lazy_repair_crash_recovery_and_download_e2e() {
         .await
         .expect("upload payload");
         let init_block = init_block.expect("bounty deposit block");
-        assert_eq!(init_block.header.height, 11);
+        assert_eq!(init_block.header.height, REGISTERED_COUNT as u64 + 1);
 
         // 디스크 영속화 검증
-        assert!(NodeStorage::load_shard(&tmp.path.join("storage_0"), 0, &manifest.object_id_hex)
+        assert!(NodeStorage::load_shard(&tmp.path.join("storage_1"), 0, &manifest.object_id_hex)
             .expect("load shard 0")
             .is_some());
         assert!(tmp.path.join("validator_0/l1_snapshot.json").exists());
         assert!(tmp.path.join("validator_0/blocks.jsonl").exists());
 
-        // 3. 검증자 1대(v3) 다운 + 스토리지 노드 6대(0번 반장 포함, 슬롯 0..60) 강제 중단
+        // Leave the standby online while the first six L1 roster members go offline.
         let v3 = validators.pop().expect("v3");
         v3.shutdown().await;
-        for _ in 0..6 {
-            let h = storage_nodes.remove(0);
-            h.shutdown().await;
+        let down_nodes: Vec<_> = storage_nodes.drain(1..=DOWN_NODES).collect();
+        for node in down_nodes {
+            node.shutdown().await;
         }
-        // 남은 storage_nodes: [node 6, node 7, node 8, node 9] (슬롯 60..100, 활성 40개)
 
-        // 4. 생존한 최선순위 노드(node 6, 슬롯 60)가 자동으로 반장 승계 -> TCP 지연 복구 + L1 체크포인트 BFT 확정
         let report: CycleReportDto = http_request_json(
-            &storage_nodes[0].rpc_url,
+            &storage_nodes[1].rpc_url,
             "POST",
             "/aggregator/run_cycle",
             Some(&RunCycleReq { epoch: 1 }),
@@ -180,45 +187,48 @@ fn distributed_bft_lazy_repair_crash_recovery_and_download_e2e() {
         .await
         .expect("run aggregator cycle");
 
-        assert_eq!(report.aggregator_slot, 60);
-        assert_eq!(report.online_slots, 40);
-        assert_eq!(report.accessible_shards_before, 40);
-        assert_eq!(report.repaired_slots, (0..20).map(|i| i as u8).collect::<Vec<_>>());
-        assert_eq!(report.accessible_shards_after, 60);
+        assert_eq!(report.aggregator_slot, DOWN_NODES as u8);
+        assert_eq!(report.online_slots, T_REPAIR);
+        assert_eq!(report.accessible_shards_before, T_REPAIR);
+        assert_eq!(
+            report.repaired_slots,
+            (0..(T_TARGET - T_REPAIR) as u8).collect::<Vec<_>>()
+        );
+        assert_eq!(report.accessible_shards_after, T_TARGET);
         assert_eq!(report.aggregator_bonus, 50);
-        assert_eq!(report.block_height, 12);
+        assert_eq!(report.block_height, REGISTERED_COUNT as u64 + 2);
         assert_ne!(report.new_blobs_root_hex, manifest.root_hex);
 
-        // 반장(슬롯 60)이 온라인 피어(예: storage_7의 슬롯 72)에 발급한 Heartbeat 영수증 디스크 저장 확인
+        // L1 slot 7 uses the key and endpoint from cluster map slot 8.
         let (receipt_agg_slot, receipt_sig) =
-            NodeStorage::load_heartbeat_receipt(&tmp.path.join("storage_7"), 1, 72)
+            NodeStorage::load_heartbeat_receipt(&tmp.path.join("storage_8"), 1, 7)
                 .expect("load heartbeat receipt")
                 .expect("online peer must persist aggregator heartbeat receipt");
-        assert_eq!(receipt_agg_slot, 60);
+        assert_eq!(receipt_agg_slot, DOWN_NODES as u8);
         assert_ne!(receipt_sig, [0u8; 64]);
 
-        // 좀비 generation 가드: custodian node 6에 generation=0 과거 덮어쓰기 시도 (custodian 아닌 일반 슬롯 60에 대해서는 rejection 검증)
-        let (slot60_shard, _) =
-            NodeStorage::load_shard(&tmp.path.join("storage_6"), 60, &manifest.object_id_hex)
-                .expect("read slot 60")
-                .expect("slot 60 exists");
-        // slot 60의 meta generation을 1로 높인 뒤 generation=0 덮어쓰기 거부 확인
+        // 좀비 generation 가드: custodian node 6에 generation=0 과거 덮어쓰기 시도 (custodian 아닌 일반 슬롯 6에 대해서는 rejection 검증)
+        let (slot6_shard, _) =
+            NodeStorage::load_shard(&tmp.path.join("storage_7"), 6, &manifest.object_id_hex)
+                .expect("read slot 6")
+                .expect("slot 6 exists");
+        // slot 6의 meta generation을 1로 높인 뒤 generation=0 덮어쓰기 거부 확인
         assert!(NodeStorage::save_shard(
-            &tmp.path.join("storage_6"),
-            60,
+            &tmp.path.join("storage_7"),
+            6,
             false,
             1,
-            &slot60_shard,
+            &slot6_shard,
             ""
         )
         .expect("upgrade gen"));
         let stale_reply = send_p2p(
-            storage_nodes[0].p2p_addr,
+            storage_nodes[1].p2p_addr,
             &P2pRequest::StoreShard {
-                slot: 60,
+                slot: 6,
                 is_custodian: false,
                 generation: 0,
-                shard: slot60_shard,
+                shard: slot6_shard,
                 proof_hex: String::new(),
             },
         )
@@ -249,10 +259,9 @@ fn distributed_bft_lazy_repair_crash_recovery_and_download_e2e() {
             http_request_json::<(), L1StatusDto>(&v0_restarted.rpc_url, "GET", "/status", None)
                 .await
                 .expect("status after restart");
-        assert_eq!(recovered_status.height, 12);
-        assert_eq!(recovered_status.registered_nodes, SWARM_SIZE);
-        let expected_roster_pks: Vec<[u8; 33]> = cluster_map
-            .slots
+        assert_eq!(recovered_status.height, REGISTERED_COUNT as u64 + 2);
+        assert_eq!(recovered_status.registered_nodes, REGISTERED_COUNT);
+        let expected_roster_pks: Vec<[u8; 33]> = cluster_map.slots[1..]
             .iter()
             .map(|s| decode_fixed_hex::<33>(&s.pubkey_hex).expect("slot pubkey hex"))
             .collect();
@@ -265,15 +274,15 @@ fn distributed_bft_lazy_repair_crash_recovery_and_download_e2e() {
             report.new_blobs_root_hex
         );
 
-        // 6. 살아있는 4대 노드(60개 접근 가능 조각 = 40 원본 + 20 복구 조각)에서 실제 TCP로 받아 원본 100% 복원
+        // 6. 살아있는 4대 노드(6개 접근 가능 조각 = 4 원본 + 2 복구 조각)에서 실제 TCP로 받아 원본 100% 복원
         let (decoded, collected) = download_payload(
             &cluster_map,
             &manifest.object_id_hex,
-            Some(&storage_nodes[0].rpc_url),
+            Some(&storage_nodes[1].rpc_url),
         )
         .await
         .expect("download & decode");
-        assert!(collected >= 30);
+        assert_eq!(collected, T_TARGET);
         assert_eq!(decoded, payload);
 
         v0_restarted.shutdown().await;
@@ -323,7 +332,7 @@ fn p2p_heartbeat_receipt_fault_proof_and_custodian_handoff_e2e() {
             validators.push(handle);
         }
 
-        let node_endpoints: Vec<(u64, SocketAddr, SocketAddr)> = (0..10u64)
+        let node_endpoints: Vec<(u64, SocketAddr, SocketAddr)> = (0..NODE_COUNT as u64)
             .map(|id| (id, reserve_addr(), reserve_addr()))
             .collect();
         let cluster_map =
@@ -341,8 +350,8 @@ fn p2p_heartbeat_receipt_fault_proof_and_custodian_handoff_e2e() {
                 l1_rpc_url: validators[0].rpc_url.clone(),
                 cluster_map: cluster_map.clone(),
                 data_dir: tmp.path.join(format!("storage_{node_id}")),
-                trigger: 45,
-                target: 60,
+                ip_subnet_hash: *node_id as u16,
+                country_code: (*node_id % 8) as u8,
                 kzg_seed: DEFAULT_KZG_SEED,
             })
             .await
@@ -353,11 +362,11 @@ fn p2p_heartbeat_receipt_fault_proof_and_custodian_handoff_e2e() {
         let reg_count = register_cluster_via_nodes(&cluster_map)
             .await
             .expect("register all nodes");
-        assert_eq!(reg_count, SWARM_SIZE);
+        assert_eq!(reg_count, NODE_COUNT);
 
         let kzg = ValidatorStorage::load_or_create_kzg(
             &tmp.path.join("client_kzg"),
-            SWARM_SIZE - 1,
+            MAX_SWARM_SIZE - 1,
             DEFAULT_KZG_SEED,
         )
         .expect("client kzg");
@@ -373,20 +382,21 @@ fn p2p_heartbeat_receipt_fault_proof_and_custodian_handoff_e2e() {
         .await
         .expect("upload payload");
 
-        // 1. 반장(슬롯 0)이 피어(슬롯 12, storage_1)에게 IssueHeartbeatReceipt 발급 & Ping 영수증 저장 검증
-        let agg0_key = deterministic_signing_key(slot_key_seed(0));
-        let hb_msg_12 = heartbeat_signing_bytes(0, 1, 12);
-        let hb_sig_12: Signature = agg0_key.sign(&hb_msg_12);
-        let hb_sig_12_bytes: [u8; 64] = hb_sig_12.to_bytes().into();
+        // 1. 반장(슬롯 0)이 피어(슬롯 1, storage_1)에게 IssueHeartbeatReceipt 발급 & Ping 영수증 저장 검증
+        let agg0_key = deterministic_signing_key(slot_key_seed(0, NODE_COUNT));
+        let hb_msg_1 = heartbeat_signing_bytes(0, 1, 1);
+        let hb_sig_1: Signature = agg0_key.sign(&hb_msg_1);
+        let hb_sig_1_bytes: [u8; 64] = hb_sig_1.to_bytes().into();
 
         let issue_resp = send_p2p(
             storage_nodes[1].p2p_addr,
             &P2pRequest::IssueHeartbeatReceipt {
                 swarm_id: 0,
                 epoch: 1,
-                target_slot: 12,
+                target_slot: 1,
+                target_map_slot: None,
                 aggregator_slot: 0,
-                sig_hex: hex::encode(hb_sig_12_bytes),
+                sig_hex: hex::encode(hb_sig_1_bytes),
             },
         )
         .await
@@ -400,50 +410,51 @@ fn p2p_heartbeat_receipt_fault_proof_and_custodian_handoff_e2e() {
                 swarm_id: 0,
                 epoch: 1,
                 target_slot: 0,
+                target_map_slot: None,
                 aggregator_slot: 0,
-                sig_hex: hex::encode(hb_sig_12_bytes),
+                sig_hex: hex::encode(hb_sig_1_bytes),
             },
         )
         .await
         .expect("send IssueHeartbeatReceipt invalid slot");
         assert!(matches!(invalid_slot_resp, P2pResponse::Error { .. }));
 
-        // Ping에 실려 온 aggregator_sig_hex 역시 피어 디스크에 저장되는지 확인 (슬롯 25, storage_2)
-        let hb_msg_25 = heartbeat_signing_bytes(0, 1, 25);
-        let hb_sig_25: Signature = agg0_key.sign(&hb_msg_25);
-        let hb_sig_25_bytes: [u8; 64] = hb_sig_25.to_bytes().into();
+        // Ping에 실려 온 aggregator_sig_hex 역시 피어 디스크에 저장되는지 확인 (슬롯 2, storage_2)
+        let hb_msg_2 = heartbeat_signing_bytes(0, 1, 2);
+        let hb_sig_2: Signature = agg0_key.sign(&hb_msg_2);
+        let hb_sig_2_bytes: [u8; 64] = hb_sig_2.to_bytes().into();
         let ping_resp = send_p2p(
             storage_nodes[2].p2p_addr,
             &P2pRequest::Ping {
                 from_slot: 0,
-                target_slot: 25,
+                target_slot: 2,
                 epoch: 1,
-                aggregator_sig_hex: hex::encode(hb_sig_25_bytes),
+                aggregator_sig_hex: hex::encode(hb_sig_2_bytes),
             },
         )
         .await
         .expect("send Ping with receipt");
-        assert!(matches!(ping_resp, P2pResponse::Pong { slot: 25, epoch: 1, .. }));
+        assert!(matches!(ping_resp, P2pResponse::Pong { slot: 2, epoch: 1, .. }));
         assert_eq!(
-            NodeStorage::load_heartbeat_receipt(&tmp.path.join("storage_2"), 1, 25)
-                .expect("load slot 25 receipt"),
-            Some((0, hb_sig_25_bytes))
+            NodeStorage::load_heartbeat_receipt(&tmp.path.join("storage_2"), 1, 2)
+                .expect("load slot 2 receipt"),
+            Some((0, hb_sig_2_bytes))
         );
 
-        // 2. 반장(슬롯 0)이 에포크 1 정산 시 슬롯 12를 결석(0)으로 허위 보고 -> 디스크 영수증으로 Fault Proof 슬래싱!
+        // 2. 반장(슬롯 0)이 에포크 1 정산 시 슬롯 1을 결석(0)으로 허위 보고 -> 디스크 영수증으로 Fault Proof 슬래싱!
         let status: L1StatusDto =
             http_request_json::<(), L1StatusDto>(&validators[0].rpc_url, "GET", "/status", None)
                 .await
                 .expect("get status");
         let epoch_seed = decode_fixed_hex::<32>(&status.epoch_seed_hex).expect("epoch seed");
         let root_bytes = decode_fixed_hex::<48>(&manifest.root_hex).expect("root bytes");
-        let sample_index = expected_sample_index(&epoch_seed, 0, 1, SWARM_SIZE);
+        let sample_index = expected_sample_index(&epoch_seed, 0, 1, NODE_COUNT);
         let sample_eval =
             decode_fixed_hex::<32>(&manifest.slot_fps_hex[sample_index as usize]).expect("eval");
         let kzg_sample_proof =
             decode_fixed_hex::<48>(&manifest.slot_proofs_hex[sample_index as usize])
                 .expect("proof");
-        let malicious_bitmap = ((1u128 << SWARM_SIZE) - 1) & !(1u128 << 12);
+        let malicious_bitmap = ((1u128 << NODE_COUNT) - 1) & !(1u128 << 1);
         let ckpt_msg = NativeTransaction::checkpoint_signing_bytes(
             0,
             1,
@@ -478,15 +489,15 @@ fn p2p_heartbeat_receipt_fault_proof_and_custodian_handoff_e2e() {
         .expect("submit malicious checkpoint");
 
         let (stored_agg_slot, stored_sig) =
-            NodeStorage::load_heartbeat_receipt(&tmp.path.join("storage_1"), 1, 12)
-                .expect("load slot 12 receipt")
-                .expect("slot 12 receipt must exist on disk");
+            NodeStorage::load_heartbeat_receipt(&tmp.path.join("storage_1"), 1, 1)
+                .expect("load slot 1 receipt")
+                .expect("slot 1 receipt must exist on disk");
         assert_eq!(stored_agg_slot, 0);
 
         let fault_tx = NativeTransaction::SubmitHeartbeatFaultProof {
             swarm_id: 0,
             epoch: 1,
-            node_slot: 12,
+            node_slot: 1,
             aggregator_slot: stored_agg_slot,
             signed_pong_receipt: stored_sig,
         };
@@ -503,8 +514,8 @@ fn p2p_heartbeat_receipt_fault_proof_and_custodian_handoff_e2e() {
         assert_eq!(fault_block.receipts[0].slashed_amount, 500);
         assert_eq!(fault_block.receipts[0].distributed_reward, 500);
 
-        // 3. 노드 0..6 중단 후 에포크 2 복구 실행 -> storage_6가 custodian으로 보관한 슬롯 0 조각을 대기 노드(standby_10)로 HandoffShard 이관
-        for _ in 0..6 {
+        // 3. 노드 0..5 중단 후 에포크 2 복구 실행 -> storage_6가 custodian으로 보관한 슬롯 0 조각을 대기 노드(standby_10)로 HandoffShard 이관
+        for _ in 0..DOWN_NODES {
             let h = storage_nodes.remove(0);
             h.shutdown().await;
         }
@@ -518,7 +529,7 @@ fn p2p_heartbeat_receipt_fault_proof_and_custodian_handoff_e2e() {
         .expect("run epoch 2 repair cycle");
         assert!(report.repaired_slots.contains(&0));
         assert!(
-            NodeStorage::load_heartbeat_receipt(&tmp.path.join("storage_7"), 2, 72)
+            NodeStorage::load_heartbeat_receipt(&tmp.path.join("storage_7"), 2, 7)
                 .expect("load epoch 2 receipt")
                 .is_some()
         );
@@ -545,8 +556,8 @@ fn p2p_heartbeat_receipt_fault_proof_and_custodian_handoff_e2e() {
             l1_rpc_url: validators[0].rpc_url.clone(),
             cluster_map,
             data_dir: tmp.path.join("standby_10"),
-            trigger: 45,
-            target: 60,
+            ip_subnet_hash: NODE_COUNT as u16,
+            country_code: 2,
             kzg_seed: DEFAULT_KZG_SEED,
         })
         .await
@@ -656,7 +667,7 @@ fn auto_shuffle_zero_tx_routing_and_multifile_upload_download_e2e() {
             validators.push(handle);
         }
 
-        let node_endpoints: Vec<(u64, SocketAddr, SocketAddr)> = (0..10u64)
+        let node_endpoints: Vec<(u64, SocketAddr, SocketAddr)> = (0..NODE_COUNT as u64)
             .map(|id| (id, reserve_addr(), reserve_addr()))
             .collect();
         let cluster_map =
@@ -674,8 +685,8 @@ fn auto_shuffle_zero_tx_routing_and_multifile_upload_download_e2e() {
                 l1_rpc_url: validators[0].rpc_url.clone(),
                 cluster_map: cluster_map.clone(),
                 data_dir: tmp.path.join(format!("storage_{node_id}")),
-                trigger: 45,
-                target: 60,
+                ip_subnet_hash: *node_id as u16,
+                country_code: (*node_id % 8) as u8,
                 kzg_seed: DEFAULT_KZG_SEED,
             })
             .await
@@ -687,7 +698,7 @@ fn auto_shuffle_zero_tx_routing_and_multifile_upload_download_e2e() {
         let reg_count = register_cluster_via_nodes(&cluster_map)
             .await
             .expect("register all nodes");
-        assert_eq!(reg_count, SWARM_SIZE);
+        assert_eq!(reg_count, NODE_COUNT);
 
         let status: L1StatusDto =
             http_request_json::<(), L1StatusDto>(&validators[1].rpc_url, "GET", "/status", None)
@@ -707,7 +718,7 @@ fn auto_shuffle_zero_tx_routing_and_multifile_upload_download_e2e() {
         // 2. bounty=0으로 서로 다른 2개 파일을 Zero-Tx P2P 업로드 (온체인 블록 높이 증가 없음)
         let kzg = ValidatorStorage::load_or_create_kzg(
             &tmp.path.join("client_kzg"),
-            SWARM_SIZE - 1,
+            MAX_SWARM_SIZE - 1,
             DEFAULT_KZG_SEED,
         )
         .expect("client kzg");
@@ -755,7 +766,7 @@ fn auto_shuffle_zero_tx_routing_and_multifile_upload_download_e2e() {
         )
         .await
         .expect("download file A");
-        assert!(count_a >= 30);
+        assert!(count_a >= K);
         assert_eq!(decoded_a, payload_a);
 
         let (decoded_b, count_b) = download_payload(
@@ -765,11 +776,11 @@ fn auto_shuffle_zero_tx_routing_and_multifile_upload_download_e2e() {
         )
         .await
         .expect("download file B");
-        assert!(count_b >= 30);
+        assert!(count_b >= K);
         assert_eq!(decoded_b, payload_b);
 
         // 4. 6대 다운 후 Zero-Tx 초기 루트([0u8; 48])에서 지연 복구 체크포인트 전이 검증
-        for _ in 0..6 {
+        for _ in 0..DOWN_NODES {
             let h = storage_nodes.remove(0);
             h.shutdown().await;
         }
@@ -781,8 +792,8 @@ fn auto_shuffle_zero_tx_routing_and_multifile_upload_download_e2e() {
         )
         .await
         .expect("run aggregator cycle from zero root");
-        assert_eq!(report.aggregator_slot, 60);
-        assert_eq!(report.repaired_slots.len(), 20);
+        assert_eq!(report.aggregator_slot, DOWN_NODES as u8);
+        assert_eq!(report.repaired_slots.len(), T_TARGET - T_REPAIR);
         assert_eq!(report.block_height, 11);
         assert_eq!(report.aggregator_bonus, 50);
 

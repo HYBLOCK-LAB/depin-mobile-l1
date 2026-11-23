@@ -1,6 +1,8 @@
+use crate::shuffler::swarm_params;
 use crate::state_db::{
     compute_member_verkle_root, open_member_verkle_proof, verify_member_verkle_proof,
-    EnshrinedSwarmDB, NativeTransaction, NodeAccount, VirtualSwarmState, SWARM_SIZE,
+    EnshrinedSwarmDB, NativeTransaction, NodeAccount, VirtualSwarmState, DEFAULT_UPTIME_BPS,
+    MAX_SWARM_SIZE, MIN_SWARM_SIZE,
 };
 use crate::{Error, Result};
 use p256::ecdsa::{
@@ -189,16 +191,20 @@ impl Executor {
         active_blobs_root: KzgRoot,
         initial_bounty: u128,
     ) -> Result<()> {
-        if roster.len() != SWARM_SIZE {
+        let n = roster.len();
+        if !(MIN_SWARM_SIZE..=MAX_SWARM_SIZE).contains(&n) {
             return Err(Error::InvalidInput);
         }
         let mut total_bond = 0u128;
+        let mut uptime_sum = 0u64;
         for pk in &roster {
             let acc = self.db.nodes.get(pk).ok_or(Error::Unauthorized)?;
             total_bond = total_bond
                 .checked_add(acc.stake)
                 .ok_or(Error::InvalidInput)?;
+            uptime_sum += u64::from(acc.ema_uptime_bps);
         }
+        let params = swarm_params(n, (uptime_sum / n as u64) as u16)?;
         self.db.swarm_rosters.insert(swarm_id, roster);
         self.db.swarms.insert(
             swarm_id,
@@ -209,21 +215,23 @@ impl Executor {
                 total_bond_balance: total_bond,
                 storage_bounty_pool: initial_bounty,
                 last_epoch_settled: 0,
-                min_threshold_k: 30,
-                lazy_repair_trigger: 45,
+                swarm_size_n: params.n,
+                min_threshold_k: params.k,
+                lazy_repair_trigger: params.t_repair,
+                lazy_repair_target: params.t_target,
             },
         );
         Ok(())
     }
 
-    /// 대기 풀에 100대(SWARM_SIZE) 이상의 노드가 모이면 VRF+다양성 셔플러로 가상 스웜을 자동 편성한다.
+    /// 대기 풀에 MIN_SWARM_SIZE 이상의 노드가 모이면 VRF+다양성 셔플러로 가상 스웜을 자동 편성한다.
     pub fn auto_shuffle_standby_swarms(
         &mut self,
         kzg: &Kzg,
         epoch_seed: &[u8; 32],
         default_bounty: u128,
     ) -> Result<Vec<u64>> {
-        if self.db.standby_pool.len() < SWARM_SIZE {
+        if self.db.standby_pool.len() < MIN_SWARM_SIZE {
             return Ok(Vec::new());
         }
 
@@ -295,6 +303,7 @@ impl Executor {
                         reward_balance: 0,
                         consecutive_offline_epochs: 0,
                         slashed: false,
+                        ema_uptime_bps: DEFAULT_UPTIME_BPS,
                     },
                 );
                 self.db.standby_pool.push(pubkey_p256);
@@ -346,17 +355,18 @@ impl Executor {
                     .get(&swarm_id)
                     .ok_or(Error::InvalidInput)?
                     .clone();
-                if roster.len() != SWARM_SIZE {
+                let n = swarm.swarm_size_n as usize;
+                if roster.len() != n {
                     return Err(Error::InvalidInput);
                 }
                 if epoch != swarm.last_epoch_settled + 1 {
                     return Err(Error::BadEpoch);
                 }
-                if (uptime_bitmap >> SWARM_SIZE) != 0 {
+                if uptime_bitmap.checked_shr(n as u32).unwrap_or(0) != 0 {
                     return Err(Error::InvalidInput);
                 }
                 let agg_idx = aggregator_slot as usize;
-                if agg_idx >= SWARM_SIZE || (uptime_bitmap & (1u128 << agg_idx)) == 0 {
+                if agg_idx >= n || (uptime_bitmap & (1u128 << agg_idx)) == 0 {
                     return Err(Error::Unauthorized);
                 }
                 if agg_idx > 0 {
@@ -399,7 +409,7 @@ impl Executor {
                 agg_vk.verify(&msg, &sig).map_err(|_| Error::BadSignature)?;
 
                 // 2. VRF 랜덤 감사 샘플에 대한 48B KZG 보유 증명 검증
-                let expected_idx = expected_sample_index(epoch_seed, swarm_id, epoch, SWARM_SIZE);
+                let expected_idx = expected_sample_index(epoch_seed, swarm_id, epoch, n);
                 if sample_index != expected_idx {
                     return Err(Error::BadProof);
                 }
@@ -433,9 +443,9 @@ impl Executor {
                         return Err(Error::BadProof);
                     }
                     let entry = &repair_log[audit.entry_index];
-                    if entry.repaired_slot as usize >= SWARM_SIZE
-                        || entry.parent_slot_a as usize >= SWARM_SIZE
-                        || entry.parent_slot_b as usize >= SWARM_SIZE
+                    if entry.repaired_slot as usize >= n
+                        || entry.parent_slot_a as usize >= n
+                        || entry.parent_slot_b as usize >= n
                         || entry.parent_slot_a == entry.parent_slot_b
                     {
                         return Err(Error::InvalidInput);
@@ -493,13 +503,9 @@ impl Executor {
                     }
 
                     // 3d. 비-복구 슬롯 무결성 검증: VRF로 지목된 미복구 슬롯이 old/new 루트에서 동일하게 유지되는지 확인
-                    if let Some(expected_unchanged) = expected_unchanged_slot_index(
-                        epoch_seed,
-                        swarm_id,
-                        epoch,
-                        &repair_log,
-                        SWARM_SIZE,
-                    ) {
+                    if let Some(expected_unchanged) =
+                        expected_unchanged_slot_index(epoch_seed, swarm_id, epoch, &repair_log, n)
+                    {
                         if audit.unchanged_slot != expected_unchanged
                             || repair_log
                                 .iter()
@@ -547,7 +553,7 @@ impl Executor {
                     agg_acc.reward_balance += agg_bonus;
                 }
 
-                // 100대 비트맵 순회 정산 & 유예 기간 초과 노드 지연 슬래싱 + 대기 노드 교체
+                // 비트맵 순회 정산 & 유예 기간 초과 노드 지연 슬래싱 + 대기 노드 교체
                 let mut total_slashed = 0u128;
                 let mut new_total_bond = staged_swarm.total_bond_balance;
                 let mut roster_changed = false;
@@ -557,9 +563,11 @@ impl Executor {
                         if let Some(acc) = staged_db.nodes.get_mut(slot_pk) {
                             acc.reward_balance += per_node;
                             acc.consecutive_offline_epochs = 0;
+                            acc.ema_uptime_bps += (10_000 - acc.ema_uptime_bps) / 8;
                         }
                     } else if let Some(acc) = staged_db.nodes.get_mut(slot_pk) {
                         acc.consecutive_offline_epochs += 1;
+                        acc.ema_uptime_bps -= acc.ema_uptime_bps / 8;
                         if acc.consecutive_offline_epochs >= self.config.grace_period_epochs {
                             let penalty = acc.stake.min(self.config.offline_slash_penalty);
                             acc.stake -= penalty;
@@ -622,10 +630,10 @@ impl Executor {
                 aggregator_slot,
                 signed_pong_receipt,
             } => {
-                if node_slot as usize >= SWARM_SIZE {
+                let swarm = self.db.swarms.get(&swarm_id).ok_or(Error::InvalidInput)?;
+                if node_slot as usize >= swarm.swarm_size_n as usize {
                     return Err(Error::InvalidInput);
                 }
-                let swarm = self.db.swarms.get(&swarm_id).ok_or(Error::InvalidInput)?;
                 let rec = self
                     .settled_history
                     .get_mut(&(swarm_id, epoch))
@@ -714,6 +722,8 @@ mod tests {
     use rand::{rngs::StdRng, SeedableRng};
     use verkle_fountain::verkle_kzg::scalar_to_bytes;
 
+    const TEST_N: usize = 100;
+
     fn key_for(seed_num: u64) -> SigningKey {
         let mut seed = [0u8; 32];
         seed[..8].copy_from_slice(&(seed_num + 100).to_le_bytes());
@@ -730,14 +740,28 @@ mod tests {
         KzgRoot,
         [u8; 32],
     ) {
+        setup_swarm_executor_n(TEST_N)
+    }
+
+    fn setup_swarm_executor_n(
+        n: usize,
+    ) -> (
+        Executor,
+        Kzg,
+        Vec<SigningKey>,
+        Vec<[u8; 33]>,
+        Vec<Scalar>,
+        KzgRoot,
+        [u8; 32],
+    ) {
         let mut rng = StdRng::seed_from_u64(42);
-        let kzg = Kzg::setup(SWARM_SIZE - 1, &mut rng);
+        let kzg = Kzg::setup(MAX_SWARM_SIZE - 1, &mut rng);
         let mut exec = Executor::new(ExecutorConfig::default());
         let epoch_seed = [0x99u8; 32];
 
-        let mut keys = Vec::with_capacity(SWARM_SIZE);
-        let mut roster = Vec::with_capacity(SWARM_SIZE);
-        for i in 0..SWARM_SIZE {
+        let mut keys = Vec::with_capacity(n);
+        let mut roster = Vec::with_capacity(n);
+        for i in 0..n {
             let sk = key_for(i as u64);
             let (pk, sig) = sign_registration(&sk, exec.config.chain_id, i as u16, 1, 2_000);
             exec.execute(
@@ -756,7 +780,7 @@ mod tests {
             roster.push(pk);
         }
 
-        let fps: Vec<Scalar> = (0..SWARM_SIZE)
+        let fps: Vec<Scalar> = (0..n)
             .map(|i| Scalar::from((i * i * 7 + 13) as u64))
             .collect();
         let root = kzg.commit(&fps).unwrap();
@@ -778,7 +802,7 @@ mod tests {
         uptime_bitmap: u128,
         epoch_seed: &[u8; 32],
     ) -> NativeTransaction {
-        let sample_index = expected_sample_index(epoch_seed, swarm_id, epoch, SWARM_SIZE);
+        let sample_index = expected_sample_index(epoch_seed, swarm_id, epoch, fps.len());
         let sample_eval = scalar_to_bytes(&fps[sample_index as usize]);
         let kzg_sample_proof = kzg.open(fps, sample_index as usize).unwrap();
         let msg = NativeTransaction::checkpoint_signing_bytes(
@@ -904,15 +928,16 @@ mod tests {
     fn init_swarm_and_deposit_bounty_validate_roster_and_amounts() {
         let mut pre_exec = Executor::new(ExecutorConfig::default());
 
-        // 100개 미만 로스터 거부
-        assert!(matches!(
-            pre_exec.init_swarm(0, vec![[0x02; 33]; 99], [0; 48], [0; 48], 100),
-            Err(Error::InvalidInput)
-        ));
+        for len in [MIN_SWARM_SIZE - 1, MAX_SWARM_SIZE + 1] {
+            assert!(matches!(
+                pre_exec.init_swarm(0, vec![[0x02; 33]; len], [0; 48], [0; 48], 100),
+                Err(Error::InvalidInput)
+            ));
+        }
 
-        // 미등록 노드가 포함된 100개 로스터 거부
+        // 미등록 노드가 포함된 로스터 거부
         assert!(matches!(
-            pre_exec.init_swarm(0, vec![[0x02; 33]; SWARM_SIZE], [0; 48], [0; 48], 100),
+            pre_exec.init_swarm(0, vec![[0x02; 33]; TEST_N], [0; 48], [0; 48], 100),
             Err(Error::Unauthorized)
         ));
 
@@ -958,7 +983,7 @@ mod tests {
     #[test]
     fn checkpoint_rejects_wrong_epoch_offline_aggregator_and_bad_vrf_sample() {
         let (mut exec, kzg, keys, _roster, fps, root, epoch_seed) = setup_swarm_executor();
-        let full_bitmap = (1u128 << SWARM_SIZE) - 1;
+        let full_bitmap = (1u128 << TEST_N) - 1;
 
         // (a) epoch != last_epoch_settled + 1 -> BadEpoch
         let wrong_epoch_tx =
@@ -997,7 +1022,7 @@ mod tests {
             ..
         } = bad_idx_tx
         {
-            *sample_index = (*sample_index + 1) % SWARM_SIZE as u8;
+            *sample_index = (*sample_index + 1) % TEST_N as u8;
             *sample_eval = scalar_to_bytes(&fps[*sample_index as usize]);
             *kzg_sample_proof = kzg.open(&fps, *sample_index as usize).unwrap();
             let msg = NativeTransaction::checkpoint_signing_bytes(
@@ -1026,7 +1051,7 @@ mod tests {
             ..
         } = bad_proof_tx
         {
-            let other_idx = (sample_index as usize + 1) % SWARM_SIZE;
+            let other_idx = (sample_index as usize + 1) % TEST_N;
             *kzg_sample_proof = kzg.open(&fps, other_idx).unwrap();
         }
         assert!(matches!(
@@ -1038,7 +1063,7 @@ mod tests {
     #[test]
     fn heartbeat_fault_proof_rejects_online_slot_duplicate_claim_and_expired_window() {
         let (mut exec, kzg, keys, _roster, fps, root, epoch_seed) = setup_swarm_executor();
-        let full_bitmap = (1u128 << SWARM_SIZE) - 1;
+        let full_bitmap = (1u128 << TEST_N) - 1;
         // 10번, 12번 슬롯 결석(0), 11번 슬롯 출석(1)
         let bitmap = full_bitmap & !(1u128 << 10) & !(1u128 << 12);
 
@@ -1134,7 +1159,7 @@ mod tests {
     #[test]
     fn checkpoint_rejects_successor_when_higher_priority_slot_is_online() {
         let (mut exec, kzg, keys, _roster, fps, root, epoch_seed) = setup_swarm_executor();
-        let full_bitmap = (1u128 << SWARM_SIZE) - 1;
+        let full_bitmap = (1u128 << TEST_N) - 1;
 
         // 0번 슬롯이 온라인(1)인데 1번 슬롯이 반장으로 제출 시도 -> Unauthorized
         let tx_slot1_while_0_online =
@@ -1183,8 +1208,8 @@ mod tests {
         use crate::state_db::RepairEntry;
 
         let epoch_seed = [0x42u8; 32];
-        let first = expected_unchanged_slot_index(&epoch_seed, 0, 1, &[], SWARM_SIZE).unwrap();
-        assert!((first as usize) < SWARM_SIZE);
+        let first = expected_unchanged_slot_index(&epoch_seed, 0, 1, &[], TEST_N).unwrap();
+        assert!((first as usize) < TEST_N);
 
         // VRF가 처음 지목한 슬롯이 repair_log에 포함되면 다음 미복구 슬롯으로 순회
         let log_with_first = vec![RepairEntry {
@@ -1194,11 +1219,11 @@ mod tests {
             factor_b: [1u8; 32],
         }];
         let second =
-            expected_unchanged_slot_index(&epoch_seed, 0, 1, &log_with_first, SWARM_SIZE).unwrap();
-        assert_eq!(second, ((first as usize + 1) % SWARM_SIZE) as u8);
+            expected_unchanged_slot_index(&epoch_seed, 0, 1, &log_with_first, TEST_N).unwrap();
+        assert_eq!(second, ((first as usize + 1) % TEST_N) as u8);
 
         // 모든 슬롯이 repair_log에 있으면 None
-        let full_log: Vec<RepairEntry> = (0..SWARM_SIZE)
+        let full_log: Vec<RepairEntry> = (0..TEST_N)
             .map(|s| RepairEntry {
                 repaired_slot: s as u8,
                 parent_slot_a: 0,
@@ -1206,7 +1231,7 @@ mod tests {
                 factor_b: [1u8; 32],
             })
             .collect();
-        assert!(expected_unchanged_slot_index(&epoch_seed, 0, 1, &full_log, SWARM_SIZE).is_none());
+        assert!(expected_unchanged_slot_index(&epoch_seed, 0, 1, &full_log, TEST_N).is_none());
     }
 
     #[test]
@@ -1214,7 +1239,7 @@ mod tests {
         use crate::state_db::{RepairAuditProof, RepairEntry};
 
         let (mut exec, kzg, keys, _roster, fps, root, epoch_seed) = setup_swarm_executor();
-        let full_bitmap = (1u128 << SWARM_SIZE) - 1;
+        let full_bitmap = (1u128 << TEST_N) - 1;
         let factor_b = Scalar::from(7u64);
         let entry = RepairEntry {
             repaired_slot: 0,
@@ -1225,7 +1250,7 @@ mod tests {
         let repair_log = vec![entry.clone()];
 
         let unchanged_slot =
-            expected_unchanged_slot_index(&epoch_seed, 0, 1, &repair_log, SWARM_SIZE).unwrap();
+            expected_unchanged_slot_index(&epoch_seed, 0, 1, &repair_log, TEST_N).unwrap();
         assert_ne!(unchanged_slot, 0);
 
         let mut tampered_fps = fps.clone();
@@ -1234,7 +1259,7 @@ mod tests {
         tampered_fps[unchanged_slot as usize] += Scalar::from(1u64);
         let tampered_root = kzg.commit(&tampered_fps).unwrap();
 
-        let sample_index = expected_sample_index(&epoch_seed, 0, 1, SWARM_SIZE);
+        let sample_index = expected_sample_index(&epoch_seed, 0, 1, TEST_N);
         let sample_eval = scalar_to_bytes(&tampered_fps[sample_index as usize]);
         let kzg_sample_proof = kzg.open(&tampered_fps, sample_index as usize).unwrap();
 
@@ -1307,7 +1332,7 @@ mod tests {
     #[test]
     fn checkpoint_rejects_tampered_member_verkle_root_and_out_of_sync_roster() {
         let (mut exec, kzg, keys, _roster, fps, root, epoch_seed) = setup_swarm_executor();
-        let full_bitmap = (1u128 << SWARM_SIZE) - 1;
+        let full_bitmap = (1u128 << TEST_N) - 1;
 
         // (a) 온체인 member_verkle_root 변조 시 체크포인트 거부
         let mut tampered_exec = exec.clone();
@@ -1360,7 +1385,7 @@ mod tests {
         .unwrap();
         assert_eq!(exec.db.standby_pool, vec![standby_pk]);
 
-        let full_bitmap = (1u128 << SWARM_SIZE) - 1;
+        let full_bitmap = (1u128 << TEST_N) - 1;
         let bitmap_without_15 = full_bitmap & !(1u128 << 15);
         let evicted_pk = roster[15];
 
@@ -1474,7 +1499,7 @@ mod tests {
     #[test]
     fn auto_shuffle_standby_swarms_forms_swarms_and_retains_remainder() {
         let mut rng = StdRng::seed_from_u64(7);
-        let kzg = Kzg::setup(SWARM_SIZE - 1, &mut rng);
+        let kzg = Kzg::setup(MAX_SWARM_SIZE - 1, &mut rng);
         let mut exec = Executor::new(ExecutorConfig::default());
         let epoch_seed = [0xABu8; 32];
 
@@ -1502,10 +1527,12 @@ mod tests {
             .unwrap();
         assert_eq!(formed, vec![0]);
         assert_eq!(exec.db.swarms.len(), 1);
-        assert_eq!(exec.db.standby_pool.len(), 5);
+        let formed_size = crate::shuffler::swarm_sizes(105)[0];
+        assert_eq!(exec.db.standby_pool.len(), 105 - formed_size);
         assert_eq!(exec.db.swarms[&0].active_blobs_root, [0u8; 48]);
         assert_eq!(exec.db.swarms[&0].storage_bounty_pool, 10_000);
-        assert_eq!(exec.db.swarm_rosters[&0].len(), SWARM_SIZE);
+        assert_eq!(exec.db.swarm_rosters[&0].len(), formed_size);
+        assert_eq!(exec.db.swarms[&0].swarm_size_n as usize, formed_size);
         assert_eq!(
             exec.db.swarms[&0].member_verkle_root,
             compute_member_verkle_root(&kzg, &exec.db.swarm_rosters[&0]).unwrap()
@@ -1513,11 +1540,56 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_updates_ema_uptime_for_online_and_offline_nodes() {
+        let (mut exec, kzg, keys, roster, fps, root, epoch_seed) = setup_swarm_executor();
+        let bitmap = ((1u128 << TEST_N) - 1) & !(1u128 << 5);
+        let ckpt =
+            build_signed_checkpoint(0, 1, 0, &keys[0], &kzg, &fps, root, bitmap, &epoch_seed);
+        exec.execute(ckpt, &kzg, &epoch_seed).unwrap();
+
+        let online = exec.db.nodes[&roster[0]].ema_uptime_bps;
+        let offline = exec.db.nodes[&roster[5]].ema_uptime_bps;
+        assert_eq!(
+            online,
+            DEFAULT_UPTIME_BPS + (10_000 - DEFAULT_UPTIME_BPS) / 8
+        );
+        assert_eq!(offline, DEFAULT_UPTIME_BPS - DEFAULT_UPTIME_BPS / 8);
+    }
+
+    #[test]
+    fn checkpoint_handles_maximum_swarm_size_bitmap() {
+        let (mut exec, kzg, keys, _roster, fps, root, epoch_seed) =
+            setup_swarm_executor_n(MAX_SWARM_SIZE);
+        assert_eq!(exec.db.swarms[&0].swarm_size_n as usize, MAX_SWARM_SIZE);
+        let ckpt =
+            build_signed_checkpoint(0, 1, 0, &keys[0], &kzg, &fps, root, u128::MAX, &epoch_seed);
+        exec.execute(ckpt, &kzg, &epoch_seed).unwrap();
+
+        let (mut small, kzg, keys, _roster, fps, root, epoch_seed) = setup_swarm_executor();
+        let out_of_range = (1u128 << TEST_N) | 1;
+        let ckpt = build_signed_checkpoint(
+            0,
+            1,
+            0,
+            &keys[0],
+            &kzg,
+            &fps,
+            root,
+            out_of_range,
+            &epoch_seed,
+        );
+        assert!(matches!(
+            small.execute(ckpt, &kzg, &epoch_seed),
+            Err(Error::InvalidInput)
+        ));
+    }
+
+    #[test]
     fn checkpoint_allows_zero_root_transition_and_validates_audit_old_root() {
         use crate::state_db::{RepairAuditProof, RepairEntry};
 
         let (mut exec, kzg, keys, _roster, fps, root, epoch_seed) = setup_swarm_executor();
-        let full_bitmap = (1u128 << SWARM_SIZE) - 1;
+        let full_bitmap = (1u128 << TEST_N) - 1;
 
         // 1. active_blobs_root == [0u8; 48] 상태에서 repair_log 없이 초기 루트 전이 허용
         exec.db.swarms.get_mut(&0).unwrap().active_blobs_root = [0u8; 48];
@@ -1542,13 +1614,13 @@ mod tests {
         let new_root = kzg.commit(&new_fps).unwrap();
         let repair_log = vec![entry.clone()];
 
-        let sample_index = expected_sample_index(&epoch_seed, 0, 1, SWARM_SIZE);
+        let sample_index = expected_sample_index(&epoch_seed, 0, 1, TEST_N);
         let sample_eval = scalar_to_bytes(&new_fps[sample_index as usize]);
         let kzg_sample_proof = kzg.open(&new_fps, sample_index as usize).unwrap();
         let audit_idx = expected_repair_audit_index(&epoch_seed, 0, 1, repair_log.len());
         assert_eq!(audit_idx, 0);
         let unchanged_slot =
-            expected_unchanged_slot_index(&epoch_seed, 0, 1, &repair_log, SWARM_SIZE).unwrap();
+            expected_unchanged_slot_index(&epoch_seed, 0, 1, &repair_log, TEST_N).unwrap();
         let unchanged_eval = scalar_to_bytes(&fps[unchanged_slot as usize]);
         let unchanged_old_proof = kzg.open(&fps, unchanged_slot as usize).unwrap();
         let unchanged_new_proof = kzg.open(&new_fps, unchanged_slot as usize).unwrap();

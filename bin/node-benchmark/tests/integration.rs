@@ -4,7 +4,7 @@ use l1_state_engine::executor::{
 };
 use l1_state_engine::shuffler::{route_file_to_swarm, shuffle, NodeDescriptor, ShuffleConfig};
 use l1_state_engine::state_db::{
-    compute_member_verkle_root, NativeTransaction, RepairEntry, SWARM_SIZE,
+    compute_member_verkle_root, NativeTransaction, RepairEntry, MAX_SWARM_SIZE,
 };
 use l1_state_engine::Error as L1Error;
 use p256::ecdsa::SigningKey;
@@ -16,6 +16,9 @@ use swarm_protocol::swarm_coordinator::{
 };
 use verkle_fountain::fountain::{decode, encode};
 use verkle_fountain::verkle_kzg::{scalar_to_bytes, Kzg, Scalar};
+
+const TEST_N: usize = 100;
+const TEST_NODE_COUNT: usize = 112;
 
 fn test_signing_key(seed_num: u64) -> SigningKey {
     let mut seed = [0u8; 32];
@@ -35,14 +38,14 @@ fn setup_network_and_swarm() -> (
     [u8; 32],
 ) {
     let mut rng = ChaCha8Rng::seed_from_u64(77);
-    let kzg = Kzg::setup(SWARM_SIZE - 1, &mut rng);
+    let kzg = Kzg::setup(MAX_SWARM_SIZE - 1, &mut rng);
     let mut exec = Executor::new(ExecutorConfig::default());
 
-    let mut node_keys = Vec::with_capacity(110);
-    let mut descriptors = Vec::with_capacity(110);
-    let mut reg_txs = Vec::with_capacity(110);
+    let mut node_keys = Vec::with_capacity(TEST_NODE_COUNT);
+    let mut descriptors = Vec::with_capacity(TEST_NODE_COUNT);
+    let mut reg_txs = Vec::with_capacity(TEST_NODE_COUNT);
 
-    for i in 0..110usize {
+    for i in 0..TEST_NODE_COUNT {
         let sk = test_signing_key(i as u64);
         let subnet = (i / 2) as u16;
         let country = (i % 8) as u8;
@@ -81,7 +84,8 @@ fn setup_network_and_swarm() -> (
 
     let shuffled = shuffle(&epoch_seed, &descriptors, &ShuffleConfig::default()).unwrap();
     assert_eq!(shuffled.swarms.len(), 1);
-    assert_eq!(shuffled.standby_pool.len(), 10);
+    assert_eq!(shuffled.swarms[0].len(), TEST_N);
+    assert_eq!(shuffled.standby_pool.len(), TEST_NODE_COUNT - TEST_N);
     let roster = shuffled.swarms[0].clone();
 
     (
@@ -102,10 +106,10 @@ fn e2e_lifecycle_safe_buffer_repair_successor_bft_settlement_and_decode() {
         setup_network_and_swarm();
 
     let payload: Vec<u8> = (0..12_345).map(|i| ((i * 29 + 7) % 253) as u8).collect();
-    let shards = encode(&payload, 30, SWARM_SIZE, 901).unwrap();
+    let shards = encode(&payload, 30, TEST_N, 901).unwrap();
     let init_fps: Vec<Scalar> = shards.iter().map(|s| s.fingerprint()).collect();
     let init_root = kzg.commit(&init_fps).unwrap();
-    let init_proofs: Vec<[u8; 48]> = (0..SWARM_SIZE)
+    let init_proofs: Vec<[u8; 48]> = (0..TEST_N)
         .map(|i| kzg.open(&init_fps, i).unwrap())
         .collect();
 
@@ -179,14 +183,12 @@ fn e2e_lifecycle_safe_buffer_repair_successor_bft_settlement_and_decode() {
 #[test]
 fn zombie_node_generation_guard_prevents_stale_overwrite() {
     let payload = vec![0xCDu8; 4096];
-    let shards = encode(&payload, 30, SWARM_SIZE, 33).unwrap();
+    let shards = encode(&payload, 30, TEST_N, 33).unwrap();
     let mut rng = ChaCha8Rng::seed_from_u64(33);
-    let kzg = Kzg::setup(SWARM_SIZE - 1, &mut rng);
+    let kzg = Kzg::setup(MAX_SWARM_SIZE - 1, &mut rng);
     let fps: Vec<Scalar> = shards.iter().map(|s| s.fingerprint()).collect();
     let root = kzg.commit(&fps).unwrap();
-    let proofs: Vec<[u8; 48]> = (0..SWARM_SIZE)
-        .map(|i| kzg.open(&fps, i).unwrap())
-        .collect();
+    let proofs: Vec<[u8; 48]> = (0..TEST_N).map(|i| kzg.open(&fps, i).unwrap()).collect();
 
     let mut fsm = LazyRepairFsm::new(shards, 45, 60).unwrap();
 
@@ -214,12 +216,10 @@ fn rejects_fraudulent_root_swap_and_slashes_dishonest_aggregator_heartbeat() {
         setup_network_and_swarm();
 
     let payload = vec![0x55u8; 4096];
-    let shards = encode(&payload, 30, SWARM_SIZE, 55).unwrap();
+    let shards = encode(&payload, 30, TEST_N, 55).unwrap();
     let fps: Vec<Scalar> = shards.iter().map(|s| s.fingerprint()).collect();
     let root = kzg.commit(&fps).unwrap();
-    let proofs: Vec<[u8; 48]> = (0..SWARM_SIZE)
-        .map(|i| kzg.open(&fps, i).unwrap())
-        .collect();
+    let proofs: Vec<[u8; 48]> = (0..TEST_N).map(|i| kzg.open(&fps, i).unwrap()).collect();
 
     let member_root = compute_member_verkle_root(&kzg, &roster).unwrap();
     exec.init_swarm(0, roster.clone(), member_root, root, 10_000)
@@ -311,12 +311,10 @@ fn delayed_slashing_triggers_after_grace_period_and_replaces_from_standby() {
         setup_network_and_swarm();
 
     let payload = vec![0x77u8; 4096];
-    let shards = encode(&payload, 30, SWARM_SIZE, 77).unwrap();
+    let shards = encode(&payload, 30, TEST_N, 77).unwrap();
     let fps: Vec<Scalar> = shards.iter().map(|s| s.fingerprint()).collect();
     let root = kzg.commit(&fps).unwrap();
-    let proofs: Vec<[u8; 48]> = (0..SWARM_SIZE)
-        .map(|i| kzg.open(&fps, i).unwrap())
-        .collect();
+    let proofs: Vec<[u8; 48]> = (0..TEST_N).map(|i| kzg.open(&fps, i).unwrap()).collect();
 
     let initial_member_root = compute_member_verkle_root(&kzg, &roster).unwrap();
     exec.init_swarm(0, roster.clone(), initial_member_root, root, 20_000)
@@ -389,10 +387,10 @@ fn rejects_out_of_order_aggregator_and_tampered_unchanged_slot_on_repair() {
         setup_network_and_swarm();
 
     let payload: Vec<u8> = (0..8_192).map(|i| ((i * 19 + 3) % 251) as u8).collect();
-    let shards = encode(&payload, 30, SWARM_SIZE, 88).unwrap();
+    let shards = encode(&payload, 30, TEST_N, 88).unwrap();
     let init_fps: Vec<Scalar> = shards.iter().map(|s| s.fingerprint()).collect();
     let init_root = kzg.commit(&init_fps).unwrap();
-    let init_proofs: Vec<[u8; 48]> = (0..SWARM_SIZE)
+    let init_proofs: Vec<[u8; 48]> = (0..TEST_N)
         .map(|i| kzg.open(&init_fps, i).unwrap())
         .collect();
 
@@ -439,7 +437,7 @@ fn rejects_out_of_order_aggregator_and_tampered_unchanged_slot_on_repair() {
         .position(|d| d.pubkey_p256 == roster[agg_slot as usize])
         .unwrap();
     let unchanged_slot =
-        expected_unchanged_slot_index(&epoch_seed, 0, 1, &repair_log, SWARM_SIZE).unwrap();
+        expected_unchanged_slot_index(&epoch_seed, 0, 1, &repair_log, TEST_N).unwrap();
 
     let mut tampered_fsm = fsm.clone();
     tampered_fsm.slots[unchanged_slot as usize]

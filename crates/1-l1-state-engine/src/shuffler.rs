@@ -1,4 +1,4 @@
-use crate::state_db::SWARM_SIZE;
+use crate::state_db::{MAX_SWARM_SIZE, MIN_SWARM_SIZE};
 use crate::{Error, Result};
 use sha3::{Digest, Keccak256};
 use std::collections::BTreeMap;
@@ -13,7 +13,6 @@ pub struct NodeDescriptor {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShuffleConfig {
-    pub swarm_size: usize,
     pub max_per_subnet: usize,
     pub max_per_country: usize,
 }
@@ -21,7 +20,6 @@ pub struct ShuffleConfig {
 impl Default for ShuffleConfig {
     fn default() -> Self {
         Self {
-            swarm_size: SWARM_SIZE,
             max_per_subnet: 2,
             max_per_country: 25,
         }
@@ -48,7 +46,7 @@ pub fn shuffle(
     nodes: &[NodeDescriptor],
     cfg: &ShuffleConfig,
 ) -> Result<ShuffleOutput> {
-    if cfg.swarm_size == 0 || cfg.max_per_subnet == 0 || cfg.max_per_country == 0 {
+    if cfg.max_per_subnet == 0 || cfg.max_per_country == 0 {
         return Err(Error::InvalidInput);
     }
 
@@ -61,11 +59,8 @@ pub fn shuffle(
     let mut pending: Vec<&NodeDescriptor> = ranked.into_iter().map(|(_, n)| n).collect();
     let mut swarms = Vec::new();
 
-    loop {
-        if pending.len() < cfg.swarm_size {
-            break;
-        }
-        let mut current = Vec::with_capacity(cfg.swarm_size);
+    for size in swarm_sizes(nodes.len()) {
+        let mut current = Vec::with_capacity(size);
         let mut subnet_counts: BTreeMap<u16, usize> = BTreeMap::new();
         let mut country_counts: BTreeMap<u8, usize> = BTreeMap::new();
         let mut spillover = Vec::new();
@@ -74,10 +69,7 @@ pub fn shuffle(
             let s_cnt = subnet_counts.get(&node.ip_subnet_hash).copied().unwrap_or(0);
             let c_cnt = country_counts.get(&node.country_code).copied().unwrap_or(0);
 
-            if current.len() < cfg.swarm_size
-                && s_cnt < cfg.max_per_subnet
-                && c_cnt < cfg.max_per_country
-            {
+            if current.len() < size && s_cnt < cfg.max_per_subnet && c_cnt < cfg.max_per_country {
                 *subnet_counts.entry(node.ip_subnet_hash).or_insert(0) += 1;
                 *country_counts.entry(node.country_code).or_insert(0) += 1;
                 current.push(node.pubkey_p256);
@@ -86,11 +78,11 @@ pub fn shuffle(
             }
         }
 
-        if current.len() == cfg.swarm_size {
+        if current.len() == size {
             swarms.push(current);
             pending = spillover;
         } else {
-            // 다양성 제약 하에서 100대 스웜을 더 이상 채울 수 없으므로 남은 노드는 모두 대기 풀로 이동
+            // 다양성 제약 하에서 스웜을 더 이상 채울 수 없으므로 남은 노드는 모두 대기 풀로 이동
             let mut leftover: Vec<[u8; 33]> = current;
             leftover.extend(spillover.into_iter().map(|n| n.pubkey_p256));
             return Ok(ShuffleOutput {
@@ -104,6 +96,49 @@ pub fn shuffle(
     Ok(ShuffleOutput {
         swarms,
         standby_pool,
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SwarmParams {
+    pub n: u8,
+    pub k: u8,
+    pub t_repair: u8,
+    pub t_target: u8,
+}
+
+pub fn swarm_sizes(m: usize) -> Vec<usize> {
+    if m < MIN_SWARM_SIZE {
+        return Vec::new();
+    }
+    let active = if m <= 15 { m } else { m - m.div_ceil(10) };
+    let s = active.div_ceil(MAX_SWARM_SIZE).max((active + 50) / 100);
+    (0..s)
+        .map(|j| active / s + usize::from(j < active % s))
+        .collect()
+}
+
+pub fn swarm_params(n: usize, avg_uptime_bps: u16) -> Result<SwarmParams> {
+    if !(MIN_SWARM_SIZE..=MAX_SWARM_SIZE).contains(&n) {
+        return Err(Error::InvalidInput);
+    }
+    const S: i64 = 10_000;
+    let u = i64::from(avg_uptime_bps.clamp(5_000, 9_500));
+    let n = n as i64;
+    let mu_s = n * u;
+    let sigma_s = ((n * u * (S - u)) as u64).isqrt() as i64;
+    let tt_raw = (2 * mu_s - 3 * sigma_s).div_euclid(2 * S);
+    let t_target = tt_raw.clamp((55 * n + 99) / 100, 80 * n / 100);
+    let lo = (35 * n + 99) / 100;
+    let hi = t_target - (12 * n / 100).max(2);
+    let tr_raw = (mu_s - 3 * sigma_s).div_euclid(S);
+    let t_repair = tr_raw.clamp(lo, hi);
+    let k = (2 * t_repair / 3).max(2);
+    Ok(SwarmParams {
+        n: n as u8,
+        k: k as u8,
+        t_repair: t_repair as u8,
+        t_target: t_target as u8,
     })
 }
 
@@ -147,10 +182,11 @@ mod tests {
         let out1 = shuffle(&seed, &nodes, &ShuffleConfig::default()).unwrap();
         let out2 = shuffle(&seed, &nodes, &ShuffleConfig::default()).unwrap();
 
+        assert_eq!(swarm_sizes(240), vec![108, 108]);
         assert_eq!(out1.swarms.len(), 2);
-        assert_eq!(out1.swarms[0].len(), 100);
-        assert_eq!(out1.swarms[1].len(), 100);
-        assert_eq!(out1.standby_pool.len(), 40);
+        assert_eq!(out1.swarms[0].len(), 108);
+        assert_eq!(out1.swarms[1].len(), 108);
+        assert_eq!(out1.standby_pool.len(), 24);
         assert_eq!(out1.swarms, out2.swarms);
 
         let r = route_file_to_swarm(&[9u8; 32], &seed, out1.swarms.len()).unwrap();
@@ -181,17 +217,10 @@ mod tests {
         let seed = [0x11; 32];
         for cfg in [
             ShuffleConfig {
-                swarm_size: 0,
-                max_per_subnet: 2,
-                max_per_country: 25,
-            },
-            ShuffleConfig {
-                swarm_size: 100,
                 max_per_subnet: 0,
                 max_per_country: 25,
             },
             ShuffleConfig {
-                swarm_size: 100,
                 max_per_subnet: 2,
                 max_per_country: 0,
             },
@@ -206,5 +235,62 @@ mod tests {
             route_file_to_swarm(&[0u8; 32], &seed, 0),
             Err(Error::InvalidInput)
         ));
+    }
+
+    #[test]
+    fn swarm_sizes_partition_active_nodes_within_bounds() {
+        for m in 0..MIN_SWARM_SIZE {
+            assert!(swarm_sizes(m).is_empty());
+        }
+        assert_eq!(swarm_sizes(10), vec![10]);
+        assert_eq!(swarm_sizes(60), vec![54]);
+        assert_eq!(swarm_sizes(100), vec![90]);
+        assert_eq!(swarm_sizes(160), vec![72, 72]);
+        assert_eq!(swarm_sizes(170), vec![77, 76]);
+
+        for m in MIN_SWARM_SIZE..=5000 {
+            let sizes = swarm_sizes(m);
+            let reserve = if m > 15 { m.div_ceil(10) } else { 0 };
+            assert!(sizes
+                .iter()
+                .all(|s| (MIN_SWARM_SIZE..=MAX_SWARM_SIZE).contains(s)));
+            assert_eq!(sizes.iter().sum::<usize>(), m - reserve);
+        }
+    }
+
+    #[test]
+    fn swarm_params_reference_values_and_invariants() {
+        assert_eq!(
+            swarm_params(100, 7500).unwrap(),
+            SwarmParams {
+                n: 100,
+                k: 37,
+                t_repair: 56,
+                t_target: 68
+            }
+        );
+        let small = swarm_params(10, 7500).unwrap();
+        assert_eq!((small.k, small.t_repair, small.t_target), (2, 4, 6));
+        assert_eq!(
+            swarm_params(100, 4000).unwrap(),
+            swarm_params(100, 5000).unwrap()
+        );
+        assert!(matches!(
+            swarm_params(MIN_SWARM_SIZE - 1, 7500),
+            Err(Error::InvalidInput)
+        ));
+        assert!(matches!(
+            swarm_params(MAX_SWARM_SIZE + 1, 7500),
+            Err(Error::InvalidInput)
+        ));
+
+        for n in MIN_SWARM_SIZE..=MAX_SWARM_SIZE {
+            for u in (5000u16..=9500).step_by(50) {
+                let p = swarm_params(n, u).unwrap();
+                assert_eq!(p.n as usize, n);
+                assert!(2 <= p.k && p.k < p.t_repair && p.t_repair < p.t_target);
+                assert!(p.t_target as usize <= n);
+            }
+        }
     }
 }

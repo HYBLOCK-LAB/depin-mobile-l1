@@ -142,6 +142,7 @@ pub fn compute_state_root(executor: &Executor) -> [u8; 32] {
             h.update(acc.reward_balance.to_le_bytes());
             h.update(acc.consecutive_offline_epochs.to_le_bytes());
             h.update([u8::from(acc.slashed)]);
+            h.update(acc.ema_uptime_bps.to_le_bytes());
         }
     } else {
         h.update([1u8]);
@@ -152,8 +153,12 @@ pub fn compute_state_root(executor: &Executor) -> [u8; 32] {
             h.update(sw.total_bond_balance.to_le_bytes());
             h.update(sw.storage_bounty_pool.to_le_bytes());
             h.update(sw.last_epoch_settled.to_le_bytes());
-            h.update(sw.min_threshold_k.to_le_bytes());
-            h.update(sw.lazy_repair_trigger.to_le_bytes());
+            h.update([
+                sw.swarm_size_n,
+                sw.min_threshold_k,
+                sw.lazy_repair_trigger,
+                sw.lazy_repair_target,
+            ]);
         }
     }
     h.finalize().into()
@@ -406,16 +411,18 @@ mod tests {
     #[test]
     fn state_root_hashes_only_onchain_swarm_headers_once_swarms_exist() {
         use crate::executor::sign_registration;
-        use crate::state_db::{compute_member_verkle_root, SWARM_SIZE};
+        use crate::state_db::{compute_member_verkle_root, VirtualSwarmState, MAX_SWARM_SIZE};
+
+        const N: usize = 100;
 
         let mut exec = Executor::new(ExecutorConfig::default());
-        let kzg = Kzg::setup(SWARM_SIZE - 1, &mut OsRng);
+        let kzg = Kzg::setup(MAX_SWARM_SIZE - 1, &mut OsRng);
         let seed = [0x11u8; 32];
 
         // 1. 스웜 초기화 전에는 등록 풀(nodes/standby_pool) 변화에 따라 state_root가 결정론적으로 갱신된다.
         let empty_root = compute_state_root(&exec);
-        let mut roster = Vec::with_capacity(SWARM_SIZE);
-        for i in 0..SWARM_SIZE {
+        let mut roster = Vec::with_capacity(N);
+        for i in 0..N {
             let sk = SigningKey::random(&mut OsRng);
             let (pk, sig) = sign_registration(&sk, exec.config.chain_id, i as u16, 1, 2_000);
             exec.execute(
@@ -449,7 +456,16 @@ mod tests {
         assert_eq!(compute_state_root(&exec), swarm_root);
 
         // 반면 온체인 148B VirtualSwarmState 헤더의 어느 필드든 바뀌면 state_root가 변경된다.
-        exec.db.swarms.get_mut(&0).unwrap().lazy_repair_trigger += 1;
-        assert_ne!(compute_state_root(&exec), swarm_root);
+        let mutations: [fn(&mut VirtualSwarmState); 4] = [
+            |sw| sw.swarm_size_n += 1,
+            |sw| sw.min_threshold_k += 1,
+            |sw| sw.lazy_repair_trigger += 1,
+            |sw| sw.lazy_repair_target += 1,
+        ];
+        for mutate in mutations {
+            let mut changed = exec.clone();
+            mutate(changed.db.swarms.get_mut(&0).unwrap());
+            assert_ne!(compute_state_root(&changed), swarm_root);
+        }
     }
 }

@@ -1,3 +1,4 @@
+use crate::client::resolve_roster;
 use crate::l1_daemon::{DEFAULT_EPOCH_SEED, DEFAULT_KZG_SEED};
 use crate::persistence::{
     compressed_pubkey, deterministic_signing_key, load_or_create_signing_key, NodeStorage,
@@ -15,13 +16,13 @@ use l1_state_engine::executor::{
     heartbeat_signing_bytes, sign_registration,
 };
 use l1_state_engine::shuffler::score_node;
-use l1_state_engine::state_db::{NativeTransaction, RepairAuditProof, RepairEntry, SWARM_SIZE};
+use l1_state_engine::state_db::{NativeTransaction, RepairAuditProof, RepairEntry, MAX_SWARM_SIZE};
 use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinSet;
 use verkle_fountain::fountain::{rank, repair_local_field, Shard};
@@ -38,8 +39,8 @@ pub struct StorageDaemonConfig {
     pub l1_rpc_url: String,
     pub cluster_map: SwarmClusterMapDto,
     pub data_dir: PathBuf,
-    pub trigger: usize,
-    pub target: usize,
+    pub ip_subnet_hash: u16,
+    pub country_code: u8,
     pub kzg_seed: u64,
 }
 
@@ -52,8 +53,8 @@ struct StorageRuntimeState {
     slot_keys: BTreeMap<u8, SigningKey>,
     kzg: Arc<Kzg>,
     data_dir: PathBuf,
-    trigger: usize,
-    target: usize,
+    ip_subnet_hash: u16,
+    country_code: u8,
 }
 
 pub struct StorageDaemonHandle {
@@ -92,46 +93,42 @@ struct RunCycleBody {
     object_id_hex: Option<String>,
 }
 
-fn sorted_slot_keys() -> &'static [(u64, SigningKey, [u8; 33])] {
-    static SORTED: OnceLock<Vec<(u64, SigningKey, [u8; 33])>> = OnceLock::new();
-    SORTED.get_or_init(|| {
-        let mut entries: Vec<(u64, SigningKey, [u8; 33], [u8; 32])> = (0..SWARM_SIZE)
-            .map(|i| {
-                let raw_seed = 5000 + i as u64;
-                let sk = deterministic_signing_key(raw_seed);
-                let pk = compressed_pubkey(&sk);
-                let score = score_node(&pk, &DEFAULT_EPOCH_SEED);
-                (raw_seed, sk, pk, score)
-            })
-            .collect();
-        entries.sort_by(|a, b| a.3.cmp(&b.3).then_with(|| a.2.cmp(&b.2)));
-        entries
-            .into_iter()
-            .map(|(seed, sk, pk, _)| (seed, sk, pk))
-            .collect()
-    })
+pub fn sorted_slot_keys(n: usize) -> Vec<(u64, SigningKey, [u8; 33])> {
+    let mut entries: Vec<(u64, SigningKey, [u8; 33], [u8; 32])> = (0..n)
+        .map(|i| {
+            let raw_seed = 5000 + i as u64;
+            let sk = deterministic_signing_key(raw_seed);
+            let pk = compressed_pubkey(&sk);
+            let score = score_node(&pk, &DEFAULT_EPOCH_SEED);
+            (raw_seed, sk, pk, score)
+        })
+        .collect();
+    entries.sort_by(|a, b| a.3.cmp(&b.3).then_with(|| a.2.cmp(&b.2)));
+    entries
+        .into_iter()
+        .map(|(seed, sk, pk, _)| (seed, sk, pk))
+        .collect()
 }
 
-pub fn slot_key_seed(slot: u8) -> u64 {
-    sorted_slot_keys()
+pub fn slot_key_seed(slot: u8, n: usize) -> u64 {
+    sorted_slot_keys(n)
         .get(slot as usize)
         .map(|(seed, _, _)| *seed)
         .unwrap_or(5000 + slot as u64)
-}
-
-pub fn slot_signing_key(slot: u8) -> SigningKey {
-    sorted_slot_keys()
-        .get(slot as usize)
-        .map(|(_, sk, _)| sk.clone())
-        .unwrap_or_else(|| deterministic_signing_key(5000 + slot as u64))
 }
 
 pub async fn start_storage_daemon(config: StorageDaemonConfig) -> Result<StorageDaemonHandle> {
     std::fs::create_dir_all(&config.data_dir)?;
     let mut slot_keys = BTreeMap::new();
     for &slot in &config.slots {
-        let key_path = config.data_dir.join("keys").join(format!("slot_{slot}.hex"));
-        let key = load_or_create_signing_key(&key_path, slot_key_seed(slot))?;
+        let key_path = config
+            .data_dir
+            .join("keys")
+            .join(format!("slot_{slot}.hex"));
+        let key = load_or_create_signing_key(
+            &key_path,
+            slot_key_seed(slot, config.cluster_map.slots.len()),
+        )?;
         slot_keys.insert(slot, key);
     }
 
@@ -142,7 +139,7 @@ pub async fn start_storage_daemon(config: StorageDaemonConfig) -> Result<Storage
     };
     let kzg = Arc::new(ValidatorStorage::load_or_create_kzg(
         &config.data_dir,
-        SWARM_SIZE - 1,
+        MAX_SWARM_SIZE - 1,
         kzg_seed,
     )?);
 
@@ -159,8 +156,8 @@ pub async fn start_storage_daemon(config: StorageDaemonConfig) -> Result<Storage
         slot_keys,
         kzg,
         data_dir: config.data_dir,
-        trigger: config.trigger,
-        target: config.target,
+        ip_subnet_hash: config.ip_subnet_hash,
+        country_code: config.country_code,
     });
 
     let p2p_task = spawn_tcp_server(p2p_listener, Arc::clone(&state), handle_storage_p2p);
@@ -213,6 +210,7 @@ async fn handle_storage_p2p(mut stream: TcpStream, state: Arc<StorageRuntimeStat
             swarm_id,
             epoch,
             target_slot,
+            target_map_slot,
             aggregator_slot,
             sig_hex,
         } => {
@@ -223,7 +221,7 @@ async fn handle_storage_p2p(mut stream: TcpStream, state: Arc<StorageRuntimeStat
                         state.swarm_id
                     ),
                 }
-            } else if state.slot_keys.contains_key(&target_slot) {
+            } else if state.slot_keys.contains_key(&target_map_slot.unwrap_or(target_slot)) {
                 NodeStorage::save_heartbeat_receipt(
                     &state.data_dir,
                     swarm_id,
@@ -420,16 +418,19 @@ async fn handle_storage_rpc(mut stream: TcpStream, state: Arc<StorageRuntimeStat
         }
         ("POST", "/register_slots") => {
             let mut txs = Vec::with_capacity(state.slot_keys.len());
-            for (&slot, sk) in &state.slot_keys {
-                let subnet = (slot as u16) / 2;
-                let country = slot % 8;
-                let (pk, sig) =
-                    sign_registration(sk, state.cluster_map.chain_id, subnet, country, 1_500);
+            for sk in state.slot_keys.values() {
+                let (pk, sig) = sign_registration(
+                    sk,
+                    state.cluster_map.chain_id,
+                    state.ip_subnet_hash,
+                    state.country_code,
+                    1_500,
+                );
                 txs.push(TxDto::from_native(&NativeTransaction::RegisterMobileNode {
                     pubkey_p256: pk,
                     hw_attestation_sig: sig,
-                    ip_subnet_hash: subnet,
-                    country_code: country,
+                    ip_subnet_hash: state.ip_subnet_hash,
+                    country_code: state.country_code,
                     stake: 1_500,
                 }));
             }
@@ -474,13 +475,13 @@ async fn handle_storage_rpc(mut stream: TcpStream, state: Arc<StorageRuntimeStat
 }
 
 async fn ping_all_slots(
-    slots: &[SlotAssignmentDto],
+    slots: &[&SlotAssignmentDto],
     from_slot: u8,
     epoch: u64,
 ) -> Result<BTreeSet<u8>> {
     let mut set = JoinSet::new();
-    for entry in slots {
-        let slot = entry.slot;
+    for (slot, entry) in slots.iter().enumerate() {
+        let map_slot = entry.slot;
         let addr: SocketAddr = entry
             .p2p_addr
             .parse()
@@ -491,7 +492,7 @@ async fn ping_all_slots(
                     addr,
                     &P2pRequest::Ping {
                         from_slot,
-                        target_slot: slot,
+                        target_slot: map_slot,
                         epoch,
                         aggregator_sig_hex: String::new(),
                     }
@@ -499,7 +500,7 @@ async fn ping_all_slots(
                 .await,
                 Ok(P2pResponse::Pong { .. })
             );
-            (slot, ok)
+            (slot as u8, ok)
         });
     }
     let mut online = BTreeSet::new();
@@ -512,27 +513,27 @@ async fn ping_all_slots(
 }
 
 async fn fetch_accessible_shards(
-    slots: &[SlotAssignmentDto],
+    slots: &[&SlotAssignmentDto],
     online_slots: &BTreeSet<u8>,
     custodian_owners: &BTreeMap<u8, u8>,
     object_id_hex: &str,
 ) -> Result<Vec<(usize, Shard)>> {
     let mut targets: Vec<(u8, SocketAddr)> = Vec::new();
-    for entry in slots {
-        let holder_slot = if online_slots.contains(&entry.slot) {
-            Some(entry.slot)
-        } else if let Some(&cust) = custodian_owners.get(&entry.slot) {
+    for slot in 0..slots.len() as u8 {
+        let holder_slot = if online_slots.contains(&slot) {
+            Some(slot)
+        } else if let Some(&cust) = custodian_owners.get(&slot) {
             online_slots.contains(&cust).then_some(cust)
         } else {
             None
         };
         if let Some(h_slot) = holder_slot {
-            if let Some(holder) = slots.iter().find(|s| s.slot == h_slot) {
+            if let Some(holder) = slots.get(h_slot as usize) {
                 let addr: SocketAddr = holder
                     .p2p_addr
                     .parse()
                     .map_err(|_| Error::Network("invalid p2p addr".into()))?;
-                targets.push((entry.slot, addr));
+                targets.push((slot, addr));
             }
         }
     }
@@ -599,59 +600,75 @@ async fn execute_aggregator_cycle(
     epoch: u64,
     object_id_hex: Option<&str>,
 ) -> Result<CycleReportDto> {
-    let local_hint_slot = *state
-        .slot_keys
-        .keys()
-        .next()
-        .ok_or_else(|| Error::Network("no slots hosted on node".into()))?;
+    let l1_status: L1StatusDto =
+        http_request_json::<(), L1StatusDto>(&state.l1_rpc_url, "GET", "/status", None).await?;
+    let epoch_seed = decode_fixed_hex::<32>(&l1_status.epoch_seed_hex)?;
+    let swarm = l1_status
+        .swarms
+        .iter()
+        .find(|s| s.swarm_id == state.swarm_id)
+        .ok_or_else(|| Error::Network("swarm missing on L1".into()))?;
+    let n = swarm.state.swarm_size_n as usize;
+    if n != swarm.roster_pubkeys_hex.len() || n > MAX_SWARM_SIZE {
+        return Err(Error::Network("invalid L1 swarm roster length".into()));
+    }
+    let trigger = swarm.state.lazy_repair_trigger as usize;
+    let target = swarm.state.lazy_repair_target as usize;
+    let roster = resolve_roster(&state.cluster_map, &swarm.roster_pubkeys_hex)?;
 
-    let online_slots =
-        ping_all_slots(&state.cluster_map.slots, local_hint_slot, epoch).await?;
+    let local_hint_slot = roster
+        .iter()
+        .position(|entry| state.slot_keys.contains_key(&entry.slot))
+        .ok_or_else(|| Error::Network(format!("node {} is not in the swarm roster", state.node_id)))?
+        as u8;
+    let online_slots = ping_all_slots(&roster, local_hint_slot, epoch).await?;
     let aggregator_slot = *online_slots
         .iter()
         .next()
         .ok_or_else(|| Error::Network("no online slots in swarm".into()))?;
 
-    let agg_key = state.slot_keys.get(&aggregator_slot).ok_or_else(|| {
-        Error::Network(format!(
-            "slot {aggregator_slot} is elected aggregator, not hosted on node {}",
-            state.node_id
-        ))
-    })?;
+    let agg_key = state
+        .slot_keys
+        .get(&roster[aggregator_slot as usize].slot)
+        .ok_or_else(|| {
+            Error::Network(format!(
+                "slot {aggregator_slot} is elected aggregator, not hosted on node {}",
+                state.node_id
+            ))
+        })?;
 
-    // 선출된 반장이 온라인 피어 슬롯들에 서명된 Heartbeat 생존 확인 영수증을 발급·저장 요청
+    // Heartbeat receipts are indexed by L1 slot, even if a peer's local key slot differs.
     let mut receipt_set = JoinSet::new();
     for &target_slot in &online_slots {
-        if let Some(entry) = state.cluster_map.slots.iter().find(|s| s.slot == target_slot) {
-            if let Ok(addr) = entry.p2p_addr.parse::<SocketAddr>() {
-                let msg = heartbeat_signing_bytes(state.swarm_id, epoch, target_slot);
-                let sig: Signature = agg_key.sign(&msg);
-                let sig_bytes: [u8; 64] = sig.to_bytes().into();
-                let sig_hex = hex::encode(sig_bytes);
-                let swarm_id = state.swarm_id;
-                receipt_set.spawn(async move {
-                    let _ = send_p2p(
-                        addr,
-                        &P2pRequest::IssueHeartbeatReceipt {
-                            swarm_id,
-                            epoch,
-                            target_slot,
-                            aggregator_slot,
-                            sig_hex,
-                        },
-                    )
-                    .await;
-                });
-            }
+        let entry = roster[target_slot as usize];
+        if let Ok(addr) = entry.p2p_addr.parse::<SocketAddr>() {
+            let msg = heartbeat_signing_bytes(state.swarm_id, epoch, target_slot);
+            let sig: Signature = agg_key.sign(&msg);
+            let sig_hex = hex::encode(sig.to_bytes());
+            let swarm_id = state.swarm_id;
+            let target_map_slot = (entry.slot != target_slot).then_some(entry.slot);
+            receipt_set.spawn(async move {
+                let _ = send_p2p(
+                    addr,
+                    &P2pRequest::IssueHeartbeatReceipt {
+                        swarm_id,
+                        epoch,
+                        target_slot,
+                        target_map_slot,
+                        aggregator_slot,
+                        sig_hex,
+                    },
+                )
+                .await;
+            });
         }
     }
     while receipt_set.join_next().await.is_some() {}
 
-    let l1_status: L1StatusDto =
-        http_request_json::<(), L1StatusDto>(&state.l1_rpc_url, "GET", "/status", None).await?;
-    let epoch_seed = decode_fixed_hex::<32>(&l1_status.epoch_seed_hex)?;
-
     let mut manifest = select_cycle_manifest(state, &l1_status, object_id_hex)?;
+    if manifest.swarm_id != state.swarm_id {
+        return Err(Error::Network("manifest belongs to a different swarm".into()));
+    }
 
     let old_root = root_from_hex(&manifest.root_hex)?;
     let old_fps: Vec<Scalar> = manifest
@@ -664,12 +681,12 @@ async fn execute_aggregator_cycle(
         .iter()
         .map(|h| proof_from_hex(h))
         .collect::<Result<Vec<_>>>()?;
-    if old_fps.len() != SWARM_SIZE || old_proofs.len() != SWARM_SIZE {
+    if old_fps.len() != n || old_proofs.len() != n {
         return Err(Error::Network("manifest length mismatch".into()));
     }
 
     let mut accessible = fetch_accessible_shards(
-        &state.cluster_map.slots,
+        &roster,
         &online_slots,
         &manifest.custodian_owners,
         &manifest.object_id_hex,
@@ -690,13 +707,15 @@ async fn execute_aggregator_cycle(
     let mut repair_log: Vec<RepairEntry> = Vec::new();
     let online_vec: Vec<u8> = online_slots.iter().copied().collect();
 
-    if accessible_before <= state.trigger {
+    if accessible_before <= trigger {
         let accessible_set: BTreeSet<usize> = accessible.iter().map(|(s, _)| *s).collect();
-        let target_slots: Vec<u8> = (0..SWARM_SIZE)
+        let target_slots: Vec<u8> = (0..n)
             .filter(|i| !accessible_set.contains(i))
             .map(|i| i as u8)
             .collect();
-        let needed = state.target.saturating_sub(accessible_before).min(target_slots.len());
+        let needed = target
+            .saturating_sub(accessible_before)
+            .min(target_slots.len());
         let parent_pool = accessible.clone();
         let m = parent_pool.len();
 
@@ -735,12 +754,7 @@ async fn execute_aggregator_cycle(
 
             let target_slot = target_slots[idx];
             let custodian = online_vec[idx % online_vec.len()];
-            let custodian_addr: SocketAddr = state
-                .cluster_map
-                .slots
-                .iter()
-                .find(|s| s.slot == custodian)
-                .ok_or_else(|| Error::Network("missing custodian in cluster map".into()))?
+            let custodian_addr: SocketAddr = roster[custodian as usize]
                 .p2p_addr
                 .parse()
                 .map_err(|_| Error::Network("invalid custodian addr".into()))?;
@@ -787,7 +801,7 @@ async fn execute_aggregator_cycle(
         (root, proofs)
     };
 
-    let sample_index = expected_sample_index(&epoch_seed, state.swarm_id, epoch, SWARM_SIZE);
+    let sample_index = expected_sample_index(&epoch_seed, state.swarm_id, epoch, n);
     let sample_eval = scalar_to_bytes(&new_fps[sample_index as usize]);
     let kzg_sample_proof = new_proofs[sample_index as usize];
 
@@ -800,14 +814,11 @@ async fn execute_aggregator_cycle(
         let pa = entry.parent_slot_a as usize;
         let pb = entry.parent_slot_b as usize;
         let pr = entry.repaired_slot as usize;
-        let unchanged_slot = expected_unchanged_slot_index(
-            &epoch_seed,
-            state.swarm_id,
-            epoch,
-            &repair_log,
-            SWARM_SIZE,
-        )
-        .ok_or_else(|| Error::Network("no unchanged slot available for repair audit".into()))?;
+        let unchanged_slot =
+            expected_unchanged_slot_index(&epoch_seed, state.swarm_id, epoch, &repair_log, n)
+                .ok_or_else(|| {
+                    Error::Network("no unchanged slot available for repair audit".into())
+                })?;
         let unchanged_idx = unchanged_slot as usize;
 
         Some(RepairAuditProof {
@@ -865,6 +876,7 @@ async fn execute_aggregator_cycle(
     .await?;
 
     manifest.root_hex = hex::encode(new_blobs_root);
+    manifest.roster_pubkeys_hex = swarm.roster_pubkeys_hex.clone();
     manifest.slot_fps_hex = new_fps
         .iter()
         .map(|s| hex::encode(scalar_to_bytes(s)))
@@ -873,12 +885,9 @@ async fn execute_aggregator_cycle(
     NodeStorage::save_manifest(&state.data_dir, &manifest)?;
 
     // 살아있는 피어 노드들에 갱신된 매니페스트 동기화
-    let unique_online_addrs: BTreeSet<SocketAddr> = state
-        .cluster_map
-        .slots
+    let unique_online_addrs: BTreeSet<SocketAddr> = online_slots
         .iter()
-        .filter(|s| online_slots.contains(&s.slot))
-        .filter_map(|s| s.p2p_addr.parse::<SocketAddr>().ok())
+        .filter_map(|&slot| roster[slot as usize].p2p_addr.parse::<SocketAddr>().ok())
         .collect();
     let mut sync_set = JoinSet::new();
     for addr in unique_online_addrs {
