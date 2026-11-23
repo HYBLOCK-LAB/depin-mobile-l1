@@ -235,19 +235,22 @@ impl Executor {
             return Ok(Vec::new());
         }
 
-        let mut descriptors = Vec::with_capacity(self.db.standby_pool.len());
+        let mut descriptors_with_uptime = Vec::with_capacity(self.db.standby_pool.len());
         for pk in &self.db.standby_pool {
             let acc = self.db.nodes.get(pk).ok_or(Error::Unauthorized)?;
-            descriptors.push(crate::shuffler::NodeDescriptor {
-                pubkey_p256: *pk,
-                ip_subnet_hash: acc.ip_subnet_hash,
-                country_code: acc.country_code,
-            });
+            descriptors_with_uptime.push((
+                crate::shuffler::NodeDescriptor {
+                    pubkey_p256: *pk,
+                    ip_subnet_hash: acc.ip_subnet_hash,
+                    country_code: acc.country_code,
+                },
+                acc.ema_uptime_bps,
+            ));
         }
 
-        let shuffled = crate::shuffler::shuffle(
+        let shuffled = crate::shuffler::shuffle_with_uptime(
             epoch_seed,
-            &descriptors,
+            &descriptors_with_uptime,
             &crate::shuffler::ShuffleConfig::default(),
         )?;
 

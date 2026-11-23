@@ -178,10 +178,12 @@ async fn handle_storage_p2p(mut stream: TcpStream, state: Arc<StorageRuntimeStat
         P2pRequest::Ping {
             from_slot,
             target_slot,
+            target_map_slot,
             epoch,
             aggregator_sig_hex,
         } => {
-            if let Some(key) = state.slot_keys.get(&target_slot) {
+            let key_slot = target_map_slot.unwrap_or(target_slot);
+            if let Some(key) = state.slot_keys.get(&key_slot) {
                 if !aggregator_sig_hex.is_empty() {
                     NodeStorage::save_heartbeat_receipt(
                         &state.data_dir,
@@ -359,6 +361,27 @@ async fn handle_storage_p2p(mut stream: TcpStream, state: Arc<StorageRuntimeStat
     Ok(())
 }
 
+fn build_registration_txs(state: &StorageRuntimeState) -> Vec<TxDto> {
+    let mut txs = Vec::with_capacity(state.slot_keys.len());
+    for sk in state.slot_keys.values() {
+        let (pk, sig) = sign_registration(
+            sk,
+            state.cluster_map.chain_id,
+            state.ip_subnet_hash,
+            state.country_code,
+            1_500,
+        );
+        txs.push(TxDto::from_native(&NativeTransaction::RegisterMobileNode {
+            pubkey_p256: pk,
+            hw_attestation_sig: sig,
+            ip_subnet_hash: state.ip_subnet_hash,
+            country_code: state.country_code,
+            stake: 1_500,
+        }));
+    }
+    txs
+}
+
 async fn handle_storage_rpc(mut stream: TcpStream, state: Arc<StorageRuntimeState>) -> Result<()> {
     let (method, path, body) = read_http_request(&mut stream).await?;
     match (method.as_str(), path.as_str()) {
@@ -416,24 +439,12 @@ async fn handle_storage_rpc(mut stream: TcpStream, state: Arc<StorageRuntimeStat
                 }
             }
         }
+        ("GET", "/registration_txs") => {
+            let txs = build_registration_txs(&state);
+            write_http_json(&mut stream, 200, &txs).await?;
+        }
         ("POST", "/register_slots") => {
-            let mut txs = Vec::with_capacity(state.slot_keys.len());
-            for sk in state.slot_keys.values() {
-                let (pk, sig) = sign_registration(
-                    sk,
-                    state.cluster_map.chain_id,
-                    state.ip_subnet_hash,
-                    state.country_code,
-                    1_500,
-                );
-                txs.push(TxDto::from_native(&NativeTransaction::RegisterMobileNode {
-                    pubkey_p256: pk,
-                    hw_attestation_sig: sig,
-                    ip_subnet_hash: state.ip_subnet_hash,
-                    country_code: state.country_code,
-                    stake: 1_500,
-                }));
-            }
+            let txs = build_registration_txs(&state);
             match http_request_json::<Vec<TxDto>, FinalizedBlockDto>(
                 &state.l1_rpc_url,
                 "POST",
@@ -481,7 +492,8 @@ async fn ping_all_slots(
 ) -> Result<BTreeSet<u8>> {
     let mut set = JoinSet::new();
     for (slot, entry) in slots.iter().enumerate() {
-        let map_slot = entry.slot;
+        let l1_slot = slot as u8;
+        let target_map_slot = (entry.slot != l1_slot).then_some(entry.slot);
         let addr: SocketAddr = entry
             .p2p_addr
             .parse()
@@ -492,15 +504,16 @@ async fn ping_all_slots(
                     addr,
                     &P2pRequest::Ping {
                         from_slot,
-                        target_slot: map_slot,
+                        target_slot: l1_slot,
+                        target_map_slot,
                         epoch,
                         aggregator_sig_hex: String::new(),
                     }
                 )
                 .await,
-                Ok(P2pResponse::Pong { .. })
+                Ok(P2pResponse::Pong { slot: reply_slot, .. }) if reply_slot == l1_slot
             );
-            (slot as u8, ok)
+            (l1_slot, ok)
         });
     }
     let mut online = BTreeSet::new();

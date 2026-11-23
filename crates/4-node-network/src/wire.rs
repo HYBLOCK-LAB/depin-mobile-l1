@@ -596,6 +596,8 @@ pub enum P2pRequest {
     Ping {
         from_slot: u8,
         target_slot: u8,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_map_slot: Option<u8>,
         epoch: u64,
         #[serde(default)]
         aggregator_sig_hex: String,
@@ -1015,6 +1017,7 @@ mod tests {
                 &P2pRequest::Ping {
                     from_slot: 1,
                     target_slot: 2,
+                    target_map_slot: None,
                     epoch: 7,
                     aggregator_sig_hex: String::new(),
                 },
@@ -1080,9 +1083,30 @@ mod tests {
             P2pRequest::Ping {
                 from_slot: 0,
                 target_slot: 5,
+                target_map_slot: None,
                 epoch: 2,
                 aggregator_sig_hex,
             } if aggregator_sig_hex.is_empty()
+        ));
+
+        let mapped_ping = P2pRequest::Ping {
+            from_slot: 0,
+            target_slot: 5,
+            target_map_slot: Some(6),
+            epoch: 2,
+            aggregator_sig_hex: "bb".repeat(64),
+        };
+        let encoded_ping = serde_json::to_vec(&mapped_ping).unwrap();
+        let decoded_ping: P2pRequest = serde_json::from_slice(&encoded_ping).unwrap();
+        assert!(matches!(
+            decoded_ping,
+            P2pRequest::Ping {
+                from_slot: 0,
+                target_slot: 5,
+                target_map_slot: Some(6),
+                epoch: 2,
+                ..
+            }
         ));
 
         let receipt_req = P2pRequest::IssueHeartbeatReceipt {

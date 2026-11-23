@@ -1,4 +1,4 @@
-use crate::state_db::{MAX_SWARM_SIZE, MIN_SWARM_SIZE};
+use crate::state_db::{DEFAULT_UPTIME_BPS, MAX_SWARM_SIZE, MIN_SWARM_SIZE};
 use crate::{Error, Result};
 use sha3::{Digest, Keccak256};
 use std::collections::BTreeMap;
@@ -39,51 +39,84 @@ pub fn score_node(pubkey: &[u8; 33], epoch_seed: &[u8; 32]) -> [u8; 32] {
     h.finalize().into()
 }
 
-/// 에포크 VRF 난수 + IP 서브넷(<=2) + 국가 코드(<=25) 다양성 필터 기반 결정론적 스웜 편성.
-/// 미완성 스웜이나 다양성 제약을 넘긴 노드는 standby_pool로 결정론적 이관(Spillover)된다.
-pub fn shuffle(
+fn effective_max_per_subnet(size: usize, base: usize) -> usize {
+    (base * size).div_ceil(100).max(base)
+}
+
+fn effective_max_per_country(size: usize, base: usize) -> usize {
+    (base * size).div_ceil(100).max(2)
+}
+
+fn try_fill_swarm<'a>(
+    pending: &[&'a NodeDescriptor],
+    size: usize,
+    max_subnet: usize,
+    max_country: usize,
+) -> (Vec<&'a NodeDescriptor>, Vec<&'a NodeDescriptor>) {
+    let mut current = Vec::with_capacity(size);
+    let mut subnet_counts: BTreeMap<u16, usize> = BTreeMap::new();
+    let mut country_counts: BTreeMap<u8, usize> = BTreeMap::new();
+    let mut spillover = Vec::with_capacity(pending.len());
+
+    for &node in pending {
+        let s_cnt = subnet_counts.get(&node.ip_subnet_hash).copied().unwrap_or(0);
+        let c_cnt = country_counts.get(&node.country_code).copied().unwrap_or(0);
+
+        if current.len() < size && s_cnt < max_subnet && c_cnt < max_country {
+            *subnet_counts.entry(node.ip_subnet_hash).or_insert(0) += 1;
+            *country_counts.entry(node.country_code).or_insert(0) += 1;
+            current.push(node);
+        } else {
+            spillover.push(node);
+        }
+    }
+    (current, spillover)
+}
+
+/// 가동률 버킷(높은 가동률 우선) + VRF 난수 + 비례 다양성 필터 기반 결정론적 스웜 편성.
+pub fn shuffle_with_uptime(
     epoch_seed: &[u8; 32],
-    nodes: &[NodeDescriptor],
+    nodes: &[(NodeDescriptor, u16)],
     cfg: &ShuffleConfig,
 ) -> Result<ShuffleOutput> {
     if cfg.max_per_subnet == 0 || cfg.max_per_country == 0 {
         return Err(Error::InvalidInput);
     }
 
-    let mut ranked: Vec<([u8; 32], &NodeDescriptor)> = nodes
+    let mut ranked: Vec<(std::cmp::Reverse<u16>, [u8; 32], &NodeDescriptor)> = nodes
         .iter()
-        .map(|n| (score_node(&n.pubkey_p256, epoch_seed), n))
+        .map(|(n, uptime_bps)| {
+            (
+                std::cmp::Reverse(*uptime_bps / 1_000),
+                score_node(&n.pubkey_p256, epoch_seed),
+                n,
+            )
+        })
         .collect();
-    ranked.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.pubkey_p256.cmp(&b.1.pubkey_p256)));
+    ranked.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.pubkey_p256.cmp(&b.2.pubkey_p256))
+    });
 
-    let mut pending: Vec<&NodeDescriptor> = ranked.into_iter().map(|(_, n)| n).collect();
+    let mut pending: Vec<&NodeDescriptor> = ranked.into_iter().map(|(_, _, n)| n).collect();
     let mut swarms = Vec::new();
 
     for size in swarm_sizes(nodes.len()) {
-        let mut current = Vec::with_capacity(size);
-        let mut subnet_counts: BTreeMap<u16, usize> = BTreeMap::new();
-        let mut country_counts: BTreeMap<u8, usize> = BTreeMap::new();
-        let mut spillover = Vec::new();
-
-        for node in pending.into_iter() {
-            let s_cnt = subnet_counts.get(&node.ip_subnet_hash).copied().unwrap_or(0);
-            let c_cnt = country_counts.get(&node.country_code).copied().unwrap_or(0);
-
-            if current.len() < size && s_cnt < cfg.max_per_subnet && c_cnt < cfg.max_per_country {
-                *subnet_counts.entry(node.ip_subnet_hash).or_insert(0) += 1;
-                *country_counts.entry(node.country_code).or_insert(0) += 1;
-                current.push(node.pubkey_p256);
-            } else {
-                spillover.push(node);
-            }
+        let max_subnet = effective_max_per_subnet(size, cfg.max_per_subnet);
+        let max_country = effective_max_per_country(size, cfg.max_per_country);
+        let (mut current, mut spillover) = try_fill_swarm(&pending, size, max_subnet, max_country);
+        if current.len() < size && max_country < cfg.max_per_country {
+            (current, spillover) =
+                try_fill_swarm(&pending, size, max_subnet, cfg.max_per_country);
         }
 
         if current.len() == size {
-            swarms.push(current);
+            swarms.push(current.into_iter().map(|n| n.pubkey_p256).collect());
             pending = spillover;
         } else {
             // 다양성 제약 하에서 스웜을 더 이상 채울 수 없으므로 남은 노드는 모두 대기 풀로 이동
-            let mut leftover: Vec<[u8; 33]> = current;
+            let mut leftover: Vec<[u8; 33]> = current.into_iter().map(|n| n.pubkey_p256).collect();
             leftover.extend(spillover.into_iter().map(|n| n.pubkey_p256));
             return Ok(ShuffleOutput {
                 swarms,
@@ -97,6 +130,21 @@ pub fn shuffle(
         swarms,
         standby_pool,
     })
+}
+
+/// 에포크 VRF 난수 + IP 서브넷 + 국가 코드 비례 다양성 필터 기반 결정론적 스웜 편성.
+/// 미완성 스웜이나 다양성 제약을 넘긴 노드는 standby_pool로 결정론적 이관(Spillover)된다.
+pub fn shuffle(
+    epoch_seed: &[u8; 32],
+    nodes: &[NodeDescriptor],
+    cfg: &ShuffleConfig,
+) -> Result<ShuffleOutput> {
+    let with_default_uptime: Vec<(NodeDescriptor, u16)> = nodes
+        .iter()
+        .cloned()
+        .map(|n| (n, DEFAULT_UPTIME_BPS))
+        .collect();
+    shuffle_with_uptime(epoch_seed, &with_default_uptime, cfg)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -292,5 +340,79 @@ mod tests {
                 assert!(p.t_target as usize <= n);
             }
         }
+    }
+
+    #[test]
+    fn shuffle_applies_proportional_caps_and_prioritizes_higher_uptime_buckets() {
+        let seed = [0x33u8; 32];
+
+        // 1. Proportional cap scaling for size > 100 (M=120 -> size=108, subnet cap=3, country cap=27)
+        // Put 3 nodes on subnet 1 so base subnet cap(2) would fail unless scaled to 3, and 26 in country 1.
+        let mut big_nodes = Vec::new();
+        for i in 0..120u16 {
+            let mut pk = [0u8; 33];
+            pk[0] = 0x02;
+            pk[1..3].copy_from_slice(&i.to_le_bytes());
+            let subnet = if i < 3 { 999 } else { i / 2 };
+            let country = if i < 26 { 1 } else { 2 + (i % 6) as u8 };
+            big_nodes.push(NodeDescriptor {
+                pubkey_p256: pk,
+                ip_subnet_hash: subnet,
+                country_code: country,
+            });
+        }
+        assert_eq!(effective_max_per_subnet(108, 2), 3);
+        assert_eq!(effective_max_per_country(108, 25), 27);
+        let big_out = shuffle(&seed, &big_nodes, &ShuffleConfig::default()).unwrap();
+        assert_eq!(big_out.swarms.len(), 1);
+        assert_eq!(big_out.swarms[0].len(), 108);
+
+        // 2. Uptime bucket prioritization: 16 nodes (10 high uptime, 6 low uptime) -> swarm n=14 takes all 10 high nodes
+        let mut uptime_nodes = Vec::new();
+        let mut high_pks = Vec::new();
+        for i in 0..16u16 {
+            let mut pk = [0u8; 33];
+            pk[0] = 0x03;
+            pk[1..3].copy_from_slice(&i.to_le_bytes());
+            let uptime = if i < 10 {
+                high_pks.push(pk);
+                9_000
+            } else {
+                4_000
+            };
+            uptime_nodes.push((
+                NodeDescriptor {
+                    pubkey_p256: pk,
+                    ip_subnet_hash: i,
+                    country_code: (i % 8) as u8,
+                },
+                uptime,
+            ));
+        }
+        let up_out = shuffle_with_uptime(&seed, &uptime_nodes, &ShuffleConfig::default()).unwrap();
+        assert_eq!(up_out.swarms.len(), 1);
+        assert_eq!(up_out.swarms[0].len(), 14);
+        assert_eq!(up_out.standby_pool.len(), 2);
+        for pk in &high_pks {
+            assert!(up_out.swarms[0].contains(pk));
+        }
+
+        // 3. Proportional country cap for smaller swarms (n=14 -> cap=4) with soft fallback when needed
+        assert_eq!(effective_max_per_country(14, 25), 4);
+        let concentrated_nodes: Vec<NodeDescriptor> = (0..16u16)
+            .map(|i| {
+                let mut pk = [0u8; 33];
+                pk[0] = 0x04;
+                pk[1..3].copy_from_slice(&i.to_le_bytes());
+                NodeDescriptor {
+                    pubkey_p256: pk,
+                    ip_subnet_hash: i,
+                    country_code: (i % 2) as u8, // up to 8 per country (> 4 proportional cap, <= 25 base)
+                }
+            })
+            .collect();
+        let fallback_out = shuffle(&seed, &concentrated_nodes, &ShuffleConfig::default()).unwrap();
+        assert_eq!(fallback_out.swarms.len(), 1);
+        assert_eq!(fallback_out.swarms[0].len(), 14);
     }
 }

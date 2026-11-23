@@ -1,7 +1,8 @@
 use l1_state_engine::executor::{expected_sample_index, heartbeat_signing_bytes};
 use l1_state_engine::state_db::{compute_member_verkle_root, NativeTransaction, MAX_SWARM_SIZE};
 use node_network::client::{
-    build_cluster_map, download_payload, register_cluster_via_nodes, slots_for_node, upload_payload,
+    build_cluster_map, download_payload, register_cluster_batch_via_nodes,
+    register_cluster_via_nodes, slots_for_node, upload_payload,
 };
 use node_network::l1_daemon::{
     start_validator_daemon, ValidatorDaemonConfig, DEFAULT_EPOCH_SEED, DEFAULT_KZG_SEED,
@@ -428,6 +429,7 @@ fn p2p_heartbeat_receipt_fault_proof_and_custodian_handoff_e2e() {
             &P2pRequest::Ping {
                 from_slot: 0,
                 target_slot: 2,
+                target_map_slot: None,
                 epoch: 1,
                 aggregator_sig_hex: hex::encode(hb_sig_2_bytes),
             },
@@ -828,6 +830,213 @@ fn auto_shuffle_zero_tx_routing_and_multifile_upload_download_e2e() {
             v.shutdown().await;
         }
         for s in storage_nodes {
+            s.shutdown().await;
+        }
+    });
+}
+
+#[test]
+fn batch_registration_16_nodes_forms_adaptive_14_node_swarm_and_repairs_e2e() {
+    use l1_state_engine::shuffler::{swarm_params, swarm_sizes};
+    use l1_state_engine::state_db::DEFAULT_UPTIME_BPS;
+    use std::collections::BTreeMap;
+
+    const BATCH_NODE_COUNT: usize = 16;
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+
+    rt.block_on(async {
+        let tmp = TempDirGuard::new("network_batch_16_e2e");
+        let custom_epoch_seed = [0xCDu8; 32];
+
+        let validator_seeds: Vec<(u64, u64)> = (0..4).map(|id| (id, 900 + id)).collect();
+        let val_p2p: Vec<SocketAddr> = (0..4).map(|_| reserve_addr()).collect();
+        let val_rpc: Vec<SocketAddr> = (0..4).map(|_| reserve_addr()).collect();
+
+        let mut validators = Vec::new();
+        for id in 0..4usize {
+            let peers: Vec<SocketAddr> = val_p2p
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != id)
+                .map(|(_, addr)| *addr)
+                .collect();
+            let handle = start_validator_daemon(ValidatorDaemonConfig {
+                validator_id: id as u64,
+                p2p_addr: val_p2p[id],
+                rpc_addr: val_rpc[id],
+                peer_p2p_addrs: peers,
+                validator_seeds: validator_seeds.clone(),
+                data_dir: tmp.path.join(format!("validator_{id}")),
+                epoch_seed: custom_epoch_seed,
+                kzg_seed: DEFAULT_KZG_SEED,
+            })
+            .await
+            .expect("start validator");
+            validators.push(handle);
+        }
+
+        let node_endpoints: Vec<(u64, SocketAddr, SocketAddr)> = (0..BATCH_NODE_COUNT as u64)
+            .map(|id| (id, reserve_addr(), reserve_addr()))
+            .collect();
+        let cluster_map =
+            build_cluster_map(0, 2602, &node_endpoints).expect("build cluster map");
+
+        let mut storage_nodes = Vec::new();
+        for (node_id, p2p_addr, rpc_addr) in &node_endpoints {
+            let slots = slots_for_node(&cluster_map, *node_id);
+            let handle = start_storage_daemon(StorageDaemonConfig {
+                node_id: *node_id,
+                slots,
+                swarm_id: 0,
+                p2p_addr: *p2p_addr,
+                rpc_addr: *rpc_addr,
+                l1_rpc_url: validators[0].rpc_url.clone(),
+                cluster_map: cluster_map.clone(),
+                data_dir: tmp.path.join(format!("storage_{node_id}")),
+                ip_subnet_hash: *node_id as u16,
+                country_code: (*node_id % 8) as u8,
+                kzg_seed: DEFAULT_KZG_SEED,
+            })
+            .await
+            .expect("start storage node");
+            storage_nodes.push(handle);
+        }
+
+        // Batch registration submits all 16 nodes in one block -> L1 forms a 14-node adaptive swarm + 2 standby.
+        let reg_block = register_cluster_batch_via_nodes(&validators[0].rpc_url, &cluster_map)
+            .await
+            .expect("batch register cluster");
+        assert_eq!(reg_block.header.height, 1);
+        assert_eq!(reg_block.header.tx_count, BATCH_NODE_COUNT);
+
+        let expected_n = swarm_sizes(BATCH_NODE_COUNT)[0];
+        assert_eq!(expected_n, 14);
+        let expected_params = swarm_params(expected_n, DEFAULT_UPTIME_BPS).expect("params");
+
+        let status: L1StatusDto =
+            http_request_json::<(), L1StatusDto>(&validators[1].rpc_url, "GET", "/status", None)
+                .await
+                .expect("status");
+        assert_eq!(status.registered_nodes, BATCH_NODE_COUNT);
+        assert_eq!(status.swarm_count, 1);
+        let swarm = &status.swarms[0];
+        assert_eq!(swarm.state.swarm_size_n, expected_params.n);
+        assert_eq!(swarm.state.min_threshold_k, expected_params.k);
+        assert_eq!(swarm.state.lazy_repair_trigger, expected_params.t_repair);
+        assert_eq!(swarm.state.lazy_repair_target, expected_params.t_target);
+        assert_eq!(swarm.roster_pubkeys_hex.len(), expected_n);
+
+        // Verify Ping with target_map_slot signs Pong & persists inline receipt under the L1 slot.
+        let slot_by_pubkey: BTreeMap<&str, &node_network::wire::SlotAssignmentDto> = cluster_map
+            .slots
+            .iter()
+            .map(|s| (s.pubkey_hex.as_str(), s))
+            .collect();
+        let l1_slot1_entry = slot_by_pubkey[swarm.roster_pubkeys_hex[1].as_str()];
+        let agg0_sk = deterministic_signing_key(slot_key_seed(
+            slot_by_pubkey[swarm.roster_pubkeys_hex[0].as_str()].slot,
+            BATCH_NODE_COUNT,
+        ));
+        let sig: Signature = agg0_sk.sign(&heartbeat_signing_bytes(0, 7, 1));
+        let inline_hb_sig: [u8; 64] = sig.to_bytes().into();
+        let ping_reply = send_p2p(
+            l1_slot1_entry.p2p_addr.parse().expect("p2p addr"),
+            &P2pRequest::Ping {
+                from_slot: 0,
+                target_slot: 1,
+                target_map_slot: (l1_slot1_entry.slot != 1).then_some(l1_slot1_entry.slot),
+                epoch: 7,
+                aggregator_sig_hex: hex::encode(inline_hb_sig),
+            },
+        )
+        .await
+        .expect("mapped ping");
+        assert!(matches!(
+            ping_reply,
+            P2pResponse::Pong {
+                slot: 1,
+                epoch: 7,
+                ..
+            }
+        ));
+        assert_eq!(
+            NodeStorage::load_heartbeat_receipt(
+                &tmp.path.join(format!("storage_{}", l1_slot1_entry.node_id)),
+                7,
+                1
+            )
+            .expect("load inline mapped receipt"),
+            Some((0, inline_hb_sig))
+        );
+
+        let kzg = ValidatorStorage::load_or_create_kzg(
+            &tmp.path.join("client_kzg"),
+            MAX_SWARM_SIZE - 1,
+            DEFAULT_KZG_SEED,
+        )
+        .expect("client kzg");
+        let payload: Vec<u8> = (0..9_000).map(|i| ((i * 23 + 11) % 251) as u8).collect();
+        let (manifest, deposit_block) = upload_payload(
+            &validators[0].rpc_url,
+            &cluster_map,
+            &kzg,
+            &payload,
+            5_000,
+            777,
+        )
+        .await
+        .expect("upload payload to adaptive swarm");
+        assert_eq!(deposit_block.expect("bounty block").header.height, 2);
+        assert_eq!(manifest.roster_pubkeys_hex.len(), expected_n);
+
+        // Take down the first (n - t_repair) roster members while leaving remaining roster & 2 standby nodes up.
+        let t_repair = expected_params.t_repair as usize;
+        let t_target = expected_params.t_target as usize;
+        let down_count = expected_n - t_repair;
+        let mut by_node_id: BTreeMap<u64, _> = storage_nodes
+            .into_iter()
+            .map(|h| (h.node_id, h))
+            .collect();
+        for pubkey in &swarm.roster_pubkeys_hex[..down_count] {
+            let node_id = slot_by_pubkey[pubkey.as_str()].node_id;
+            by_node_id.remove(&node_id).expect("down node").shutdown().await;
+        }
+        let successor_node_id = slot_by_pubkey[swarm.roster_pubkeys_hex[down_count].as_str()].node_id;
+        let successor_rpc = by_node_id[&successor_node_id].rpc_url.clone();
+
+        let report: CycleReportDto = http_request_json(
+            &successor_rpc,
+            "POST",
+            "/aggregator/run_cycle",
+            Some(&RunCycleReq { epoch: 1 }),
+        )
+        .await
+        .expect("run adaptive cycle with online standby nodes");
+        assert_eq!(report.aggregator_slot, down_count as u8);
+        assert_eq!(report.online_slots, t_repair);
+        assert_eq!(report.accessible_shards_before, t_repair);
+        assert_eq!(report.repaired_slots.len(), t_target - t_repair);
+        assert_eq!(report.accessible_shards_after, t_target);
+        assert_eq!(report.block_height, 3);
+
+        let (decoded, collected) = download_payload(
+            &cluster_map,
+            &manifest.object_id_hex,
+            Some(&successor_rpc),
+        )
+        .await
+        .expect("download & decode from adaptive swarm");
+        assert_eq!(collected, t_target);
+        assert_eq!(decoded, payload);
+
+        for v in validators {
+            v.shutdown().await;
+        }
+        for (_, s) in by_node_id {
             s.shutdown().await;
         }
     });

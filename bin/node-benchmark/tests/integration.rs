@@ -2,9 +2,12 @@ use l1_state_engine::consensus::{BftEngine, ValidatorInfo, ValidatorSigner};
 use l1_state_engine::executor::{
     expected_unchanged_slot_index, sign_registration, Executor, ExecutorConfig,
 };
-use l1_state_engine::shuffler::{route_file_to_swarm, shuffle, NodeDescriptor, ShuffleConfig};
+use l1_state_engine::shuffler::{
+    route_file_to_swarm, shuffle, swarm_params, swarm_sizes, NodeDescriptor, ShuffleConfig,
+};
 use l1_state_engine::state_db::{
-    compute_member_verkle_root, NativeTransaction, RepairEntry, MAX_SWARM_SIZE,
+    compute_member_verkle_root, NativeTransaction, RepairEntry, DEFAULT_UPTIME_BPS,
+    MAX_SWARM_SIZE,
 };
 use l1_state_engine::Error as L1Error;
 use p256::ecdsa::SigningKey;
@@ -479,4 +482,99 @@ fn rejects_out_of_order_aggregator_and_tampered_unchanged_slot_on_repair() {
     )
     .unwrap();
     exec.execute(valid_tx, &kzg, &epoch_seed).unwrap();
+}
+
+#[test]
+fn auto_shuffled_adaptive_swarm_aligns_onchain_and_fsm_parameters() {
+    const NODE_COUNT: usize = 50;
+
+    let mut rng = ChaCha8Rng::seed_from_u64(505);
+    let kzg = Kzg::setup(MAX_SWARM_SIZE - 1, &mut rng);
+    let mut exec = Executor::new(ExecutorConfig::default());
+    let epoch_seed = [0xCDu8; 32];
+
+    let mut node_keys = Vec::with_capacity(NODE_COUNT);
+    let mut node_pks = Vec::with_capacity(NODE_COUNT);
+    for i in 0..NODE_COUNT {
+        let sk = test_signing_key(700 + i as u64);
+        let subnet = i as u16;
+        let country = (i % 8) as u8;
+        let (pk, sig) = sign_registration(&sk, exec.config.chain_id, subnet, country, 1_500);
+        exec.execute(
+            NativeTransaction::RegisterMobileNode {
+                pubkey_p256: pk,
+                hw_attestation_sig: sig,
+                ip_subnet_hash: subnet,
+                country_code: country,
+                stake: 1_500,
+            },
+            &kzg,
+            &epoch_seed,
+        )
+        .unwrap();
+        node_keys.push(sk);
+        node_pks.push(pk);
+    }
+
+    let formed = exec
+        .auto_shuffle_standby_swarms(&kzg, &epoch_seed, 20_000)
+        .unwrap();
+    assert_eq!(formed, vec![0]);
+
+    let expected_n = swarm_sizes(NODE_COUNT)[0];
+    let expected_params = swarm_params(expected_n, DEFAULT_UPTIME_BPS).unwrap();
+    let swarm = exec.db.get_swarm(0).unwrap().clone();
+    assert_eq!(swarm.swarm_size_n, expected_params.n);
+    assert_eq!(swarm.min_threshold_k, expected_params.k);
+    assert_eq!(swarm.lazy_repair_trigger, expected_params.t_repair);
+    assert_eq!(swarm.lazy_repair_target, expected_params.t_target);
+    assert_eq!(exec.db.standby_pool.len(), NODE_COUNT - expected_n);
+
+    let n = swarm.swarm_size_n as usize;
+    let k = swarm.min_threshold_k as usize;
+    let t_repair = swarm.lazy_repair_trigger as usize;
+    let t_target = swarm.lazy_repair_target as usize;
+    let roster = exec.db.swarm_rosters[&0].clone();
+
+    let payload: Vec<u8> = (0..4_096).map(|i| ((i * 31 + 5) % 249) as u8).collect();
+    let shards = encode(&payload, k, n, 707).unwrap();
+    let init_fps: Vec<Scalar> = shards.iter().map(|s| s.fingerprint()).collect();
+    let init_root = kzg.commit(&init_fps).unwrap();
+    let init_proofs: Vec<[u8; 48]> = (0..n).map(|i| kzg.open(&init_fps, i).unwrap()).collect();
+
+    let mut fsm = LazyRepairFsm::new(shards, t_repair, t_target).unwrap();
+    for i in 0..(n - t_repair) {
+        fsm.drop_node(i, Some(10)).unwrap();
+    }
+    assert_eq!(fsm.active_shard_count(), t_repair);
+
+    let repair_log = fsm.repair(&kzg, &init_root, &init_proofs).unwrap();
+    assert_eq!(repair_log.len(), t_target - t_repair);
+
+    let agg_slot = select_active_aggregator(&fsm).unwrap();
+    assert_eq!(agg_slot as usize, n - t_repair);
+    let agg_idx = node_pks
+        .iter()
+        .position(|pk| *pk == roster[agg_slot as usize])
+        .unwrap();
+
+    let ckpt = build_checkpoint(
+        0,
+        1,
+        &epoch_seed,
+        &kzg,
+        &fsm,
+        &init_fps,
+        &init_proofs,
+        repair_log,
+        agg_slot,
+        &node_keys[agg_idx],
+    )
+    .unwrap();
+    let receipt = exec.execute(ckpt, &kzg, &epoch_seed).unwrap();
+    assert_ne!(receipt.active_blobs_root, Some(init_root));
+    assert_eq!(exec.db.get_swarm(0).unwrap().last_epoch_settled, 1);
+
+    let decoded = decode(&fsm.accessible_shards()).unwrap();
+    assert_eq!(decoded, payload);
 }

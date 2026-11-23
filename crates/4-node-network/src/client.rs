@@ -78,7 +78,7 @@ pub(crate) fn resolve_roster<'a>(
         .collect()
 }
 
-pub async fn register_cluster_via_nodes(cluster_map: &SwarmClusterMapDto) -> Result<usize> {
+fn unique_cluster_rpc_urls(cluster_map: &SwarmClusterMapDto) -> Vec<String> {
     let mut seen_rpc = BTreeSet::new();
     let mut rpc_urls = Vec::new();
     for entry in &cluster_map.slots {
@@ -86,15 +86,43 @@ pub async fn register_cluster_via_nodes(cluster_map: &SwarmClusterMapDto) -> Res
             rpc_urls.push(format!("http://{}", entry.rpc_addr));
         }
     }
+    rpc_urls
+}
 
+pub async fn register_cluster_via_nodes(cluster_map: &SwarmClusterMapDto) -> Result<usize> {
     let mut total_txs = 0usize;
-    for url in rpc_urls {
+    for url in unique_cluster_rpc_urls(cluster_map) {
         let block: FinalizedBlockDto =
             http_request_json::<(), FinalizedBlockDto>(&url, "POST", "/register_slots", None)
                 .await?;
         total_txs += block.header.tx_count;
     }
     Ok(total_txs)
+}
+
+/// Collects signed registration transactions from every node and submits them in a single L1 batch block.
+pub async fn register_cluster_batch_via_nodes(
+    l1_rpc_url: &str,
+    cluster_map: &SwarmClusterMapDto,
+) -> Result<FinalizedBlockDto> {
+    let mut all_txs = Vec::new();
+    for url in unique_cluster_rpc_urls(cluster_map) {
+        let txs: Vec<TxDto> =
+            http_request_json::<(), Vec<TxDto>>(&url, "GET", "/registration_txs", None).await?;
+        all_txs.extend(txs);
+    }
+    if all_txs.is_empty() {
+        return Err(Error::Network(
+            "no registration transactions collected".into(),
+        ));
+    }
+    http_request_json::<Vec<TxDto>, FinalizedBlockDto>(
+        l1_rpc_url,
+        "POST",
+        "/tx/batch",
+        Some(&all_txs),
+    )
+    .await
 }
 
 pub async fn upload_payload(
