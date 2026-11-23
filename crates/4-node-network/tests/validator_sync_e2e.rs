@@ -148,6 +148,7 @@ async fn start_storage_nodes(
                 ip_subnet_hash: *node_id as u16,
                 country_code: (*node_id % 8) as u8,
                 kzg_seed: DEFAULT_KZG_SEED,
+                auto_epoch_interval: None,
             })
             .await
             .expect("start storage node"),

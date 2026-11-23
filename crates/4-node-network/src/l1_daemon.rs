@@ -4,7 +4,7 @@ use crate::persistence::{
 use crate::wire::{
     decode_fixed_hex, read_frame, read_http_request, root_from_hex, send_p2p, spawn_tcp_server,
     write_frame, write_http_json, FinalizedBlockDto, InitSwarmRequest, L1StatusDto, NodeAccountDto,
-    P2pRequest, P2pResponse, SwarmSummaryDto, TxDto, VoteDto, MAX_SYNC_BLOCKS,
+    P2pRequest, P2pResponse, SettlementDto, SwarmSummaryDto, TxDto, VoteDto, MAX_SYNC_BLOCKS,
 };
 use crate::{Error, Result};
 use l1_state_engine::consensus::{
@@ -585,10 +585,23 @@ async fn handle_rpc_conn(
                         .get(swarm_id)
                         .map(|r| r.iter().map(hex::encode).collect())
                         .unwrap_or_default();
+                    let window = guard.exec.config.fault_challenge_window;
+                    let recent_settlements = guard
+                        .exec
+                        .settled_history
+                        .range((*swarm_id, 0)..=(*swarm_id, u64::MAX))
+                        .filter(|(_, rec)| rec.epoch + window >= st.last_epoch_settled)
+                        .map(|(_, rec)| SettlementDto {
+                            epoch: rec.epoch,
+                            aggregator_slot: rec.aggregator_slot,
+                            uptime_bitmap: rec.uptime_bitmap.to_string(),
+                        })
+                        .collect();
                     SwarmSummaryDto {
                         swarm_id: *swarm_id,
                         state: st.clone(),
                         roster_pubkeys_hex: roster,
+                        recent_settlements,
                     }
                 })
                 .collect();

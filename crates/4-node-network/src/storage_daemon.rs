@@ -1,8 +1,10 @@
-use crate::client::{fetch_l1_status, locate_node, resolve_roster, RosterMember};
+use crate::client::{
+    fault_proof_txs, fetch_l1_status, locate_node, resolve_roster, submit_native_tx, RosterMember,
+};
 use crate::l1_daemon::{DEFAULT_EPOCH_SEED, DEFAULT_KZG_SEED};
 use crate::persistence::{
     compressed_pubkey, deterministic_signing_key, load_or_create_random_signing_key,
-    load_or_create_signing_key, NodeStorage, ValidatorStorage,
+    load_or_create_signing_key, NodeStorage, ValidatorStorage, KEYS_DIR,
 };
 use crate::wire::{
     decode_fixed_hex, http_request_json, proof_from_hex, read_frame, read_http_request,
@@ -23,8 +25,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinSet;
+use tokio::time::MissedTickBehavior;
 use verkle_fountain::fountain::{rank, repair_local_field, Shard};
 use verkle_fountain::pollution_guard::{verify_homomorphic_repair, AuthenticatedShard};
 use verkle_fountain::verkle_kzg::{bytes_to_scalar, scalar_to_bytes, Kzg, KzgProof, Scalar};
@@ -51,6 +55,7 @@ pub struct StorageDaemonConfig {
     pub ip_subnet_hash: u16,
     pub country_code: u8,
     pub kzg_seed: u64,
+    pub auto_epoch_interval: Option<Duration>,
 }
 
 struct NodeIdentity {
@@ -132,7 +137,7 @@ pub fn slot_key_seed(slot: u8, n: usize) -> u64 {
 }
 
 fn load_identities(config: &StorageDaemonConfig) -> Result<Vec<NodeIdentity>> {
-    let keys_dir = config.data_dir.join("keys");
+    let keys_dir = config.data_dir.join(KEYS_DIR);
     if let Some(public) = &config.auto_register {
         if public.p2p_addr.ip().is_unspecified() || public.rpc_addr.ip().is_unspecified() {
             return Err(Error::Network(
@@ -216,12 +221,17 @@ pub async fn start_storage_daemon(config: StorageDaemonConfig) -> Result<Storage
         }
     }
 
+    let mut tasks = vec![p2p_task, rpc_task];
+    if let Some(interval) = config.auto_epoch_interval {
+        tasks.push(tokio::spawn(auto_epoch_loop(Arc::clone(&state), interval)));
+    }
+
     Ok(StorageDaemonHandle {
         node_id: config.node_id,
         p2p_addr: actual_p2p,
         rpc_addr: actual_rpc,
         rpc_url: format!("http://{actual_rpc}"),
-        tasks: vec![p2p_task, rpc_task],
+        tasks,
     })
 }
 
@@ -334,71 +344,7 @@ async fn handle_storage_p2p(mut stream: TcpStream, state: Arc<StorageRuntimeStat
             slot,
             object_id_hex,
             target_p2p_addr,
-        } => {
-            let loaded_shard =
-                NodeStorage::load_shard_by_role(&state.data_dir, slot, true, &object_id_hex)?;
-            let loaded_meta = NodeStorage::load_slot_meta_for_object(
-                &state.data_dir,
-                slot,
-                true,
-                &object_id_hex,
-            )?;
-            match (loaded_shard, loaded_meta) {
-                (Some((shard, proof_hex)), Some(meta)) => {
-                    match target_p2p_addr.parse::<SocketAddr>() {
-                        Ok(target_addr) => {
-                            let generation = meta.generation.saturating_add(1);
-                            match send_p2p(
-                                target_addr,
-                                &P2pRequest::StoreShard {
-                                    slot,
-                                    is_custodian: false,
-                                    generation,
-                                    shard,
-                                    proof_hex,
-                                },
-                            )
-                            .await
-                            {
-                                Ok(P2pResponse::StoreAck { ok: true, .. }) => {
-                                    NodeStorage::remove_custodian_shard(
-                                        &state.data_dir,
-                                        slot,
-                                        &object_id_hex,
-                                    )?;
-                                    P2pResponse::StoreAck {
-                                        ok: true,
-                                        message: "handoff complete".into(),
-                                    }
-                                }
-                                Ok(P2pResponse::StoreAck { ok: false, message }) => {
-                                    P2pResponse::StoreAck {
-                                        ok: false,
-                                        message: format!("target rejected shard: {message}"),
-                                    }
-                                }
-                                Ok(other) => P2pResponse::StoreAck {
-                                    ok: false,
-                                    message: format!("unexpected target response: {other:?}"),
-                                },
-                                Err(e) => P2pResponse::StoreAck {
-                                    ok: false,
-                                    message: format!("handoff transfer failed: {e}"),
-                                },
-                            }
-                        }
-                        Err(_) => P2pResponse::StoreAck {
-                            ok: false,
-                            message: format!("invalid target_p2p_addr: {target_p2p_addr}"),
-                        },
-                    }
-                }
-                _ => P2pResponse::StoreAck {
-                    ok: false,
-                    message: "custodian shard not found".into(),
-                },
-            }
-        }
+        } => handoff_shard(&state, slot, &object_id_hex, &target_p2p_addr).await?,
         P2pRequest::FetchShard {
             slot,
             object_id_hex,
@@ -424,6 +370,49 @@ async fn handle_storage_p2p(mut stream: TcpStream, state: Arc<StorageRuntimeStat
     };
     write_frame(&mut stream, &resp).await?;
     Ok(())
+}
+
+async fn handoff_shard(
+    state: &StorageRuntimeState,
+    slot: u8,
+    object_id_hex: &str,
+    target_p2p_addr: &str,
+) -> Result<P2pResponse> {
+    let loaded_shard = NodeStorage::load_shard_by_role(&state.data_dir, slot, true, object_id_hex)?;
+    let loaded_meta =
+        NodeStorage::load_slot_meta_for_object(&state.data_dir, slot, true, object_id_hex)?;
+    let ack = |ok: bool, message: String| P2pResponse::StoreAck { ok, message };
+    let (Some((shard, proof_hex)), Some(meta)) = (loaded_shard, loaded_meta) else {
+        return Ok(ack(false, "custodian shard not found".into()));
+    };
+    let Ok(target_addr) = target_p2p_addr.parse::<SocketAddr>() else {
+        return Ok(ack(
+            false,
+            format!("invalid target_p2p_addr: {target_p2p_addr}"),
+        ));
+    };
+    let reply = send_p2p(
+        target_addr,
+        &P2pRequest::StoreShard {
+            slot,
+            is_custodian: false,
+            generation: meta.generation.saturating_add(1),
+            shard,
+            proof_hex,
+        },
+    )
+    .await;
+    Ok(match reply {
+        Ok(P2pResponse::StoreAck { ok: true, .. }) => {
+            NodeStorage::remove_custodian_shard(&state.data_dir, slot, object_id_hex)?;
+            ack(true, "handoff complete".into())
+        }
+        Ok(P2pResponse::StoreAck { ok: false, message }) => {
+            ack(false, format!("target rejected shard: {message}"))
+        }
+        Ok(other) => ack(false, format!("unexpected target response: {other:?}")),
+        Err(e) => ack(false, format!("handoff transfer failed: {e}")),
+    })
 }
 
 fn registration_tx(state: &StorageRuntimeState, identity: &NodeIdentity, chain_id: u64) -> TxDto {
@@ -712,6 +701,212 @@ fn select_cycle_manifest(
         .ok_or_else(|| Error::Network("swarm manifest missing on node".into()))
 }
 
+fn sync_manifest_roster(manifest: &mut SwarmManifestDto, l1_roster: &[String]) {
+    let recorded = std::mem::replace(&mut manifest.roster_pubkeys_hex, l1_roster.to_vec());
+    for &slot in manifest.custodian_owners.keys() {
+        if let (Some(old), Some(new)) = (
+            recorded.get(slot as usize),
+            manifest.roster_pubkeys_hex.get_mut(slot as usize),
+        ) {
+            *new = old.clone();
+        }
+    }
+}
+
+async fn broadcast_manifest(
+    manifest: &SwarmManifestDto,
+    peers: impl IntoIterator<Item = SocketAddr>,
+) {
+    let unique_addrs: BTreeSet<SocketAddr> = peers.into_iter().collect();
+    let mut sync_set = JoinSet::new();
+    for addr in unique_addrs {
+        let m_clone = manifest.clone();
+        sync_set.spawn(async move {
+            let _ = send_p2p(addr, &P2pRequest::StoreManifest { manifest: m_clone }).await;
+        });
+    }
+    while sync_set.join_next().await.is_some() {}
+}
+
+fn plan_handoffs(
+    manifest: &SwarmManifestDto,
+    hosted_slots: &BTreeSet<u8>,
+    l1_roster: &[String],
+) -> Vec<u8> {
+    manifest
+        .custodian_owners
+        .iter()
+        .filter(|(_, custodian)| hosted_slots.contains(custodian))
+        .filter(|(&slot, _)| {
+            match (
+                manifest.roster_pubkeys_hex.get(slot as usize),
+                l1_roster.get(slot as usize),
+            ) {
+                (Some(recorded), Some(current)) => !recorded.eq_ignore_ascii_case(current),
+                _ => false,
+            }
+        })
+        .map(|(&slot, _)| slot)
+        .collect()
+}
+
+async fn handoff_to_replaced_nodes(
+    state: &StorageRuntimeState,
+    status: &L1StatusDto,
+) -> Result<()> {
+    for mut manifest in NodeStorage::list_manifests(&state.data_dir)? {
+        let Some(swarm) = status
+            .swarms
+            .iter()
+            .find(|s| s.swarm_id == manifest.swarm_id)
+        else {
+            continue;
+        };
+        let hosted_slots: BTreeSet<u8> = state
+            .identities
+            .iter()
+            .filter_map(|identity| locate_node(status, &identity.pubkey_hex))
+            .filter(|&(swarm_id, _)| swarm_id == swarm.swarm_id)
+            .map(|(_, slot)| slot)
+            .collect();
+        let slots = plan_handoffs(&manifest, &hosted_slots, &swarm.roster_pubkeys_hex);
+        if slots.is_empty() {
+            continue;
+        }
+        let roster = resolve_roster(
+            status,
+            &swarm.roster_pubkeys_hex,
+            state.cluster_map.as_ref(),
+        )?;
+        let mut changed = false;
+        for slot in slots {
+            let target = roster[slot as usize].p2p_addr.to_string();
+            match handoff_shard(state, slot, &manifest.object_id_hex, &target).await? {
+                P2pResponse::StoreAck { ok: true, .. } => {
+                    manifest.custodian_owners.remove(&slot);
+                    manifest.roster_pubkeys_hex[slot as usize] =
+                        swarm.roster_pubkeys_hex[slot as usize].clone();
+                    changed = true;
+                    println!(
+                        "HANDOFF_COMPLETE node_id={} object={} slot={slot} target={target}",
+                        state.node_id, manifest.object_id_hex
+                    );
+                }
+                other => eprintln!(
+                    "handoff of slot {slot} on node {} failed: {other:?}",
+                    state.node_id
+                ),
+            }
+        }
+        if changed {
+            NodeStorage::save_manifest(&state.data_dir, &manifest)?;
+            broadcast_manifest(&manifest, roster.iter().map(|member| member.p2p_addr)).await;
+        }
+    }
+    Ok(())
+}
+
+async fn submit_pending_fault_proofs(
+    state: &StorageRuntimeState,
+    status: &L1StatusDto,
+    submitted: &mut BTreeSet<(u64, u64, u8)>,
+) -> Result<()> {
+    for identity in &state.identities {
+        let Some((swarm_id, slot)) = locate_node(status, &identity.pubkey_hex) else {
+            continue;
+        };
+        let Some(swarm) = status.swarms.iter().find(|s| s.swarm_id == swarm_id) else {
+            continue;
+        };
+        for (epoch, tx) in fault_proof_txs(swarm, slot, &state.data_dir)? {
+            if submitted.contains(&(swarm_id, epoch, slot)) {
+                continue;
+            }
+            submit_native_tx(&state.l1_rpc_url, &tx).await?;
+            submitted.insert((swarm_id, epoch, slot));
+            println!(
+                "FAULT_PROOF_SUBMITTED node_id={} swarm={swarm_id} epoch={epoch} slot={slot}",
+                state.node_id
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn run_epoch_if_aggregator(state: &StorageRuntimeState, status: &L1StatusDto) -> Result<()> {
+    let (swarm_id, local_slot) = state
+        .identities
+        .iter()
+        .find_map(|identity| locate_node(status, &identity.pubkey_hex))
+        .ok_or_else(|| {
+            Error::Network(format!("node {} is not in any swarm roster", state.node_id))
+        })?;
+    let swarm = status
+        .swarms
+        .iter()
+        .find(|s| s.swarm_id == swarm_id)
+        .ok_or_else(|| Error::Network("swarm missing on L1".into()))?;
+    let epoch = swarm.state.last_epoch_settled + 1;
+    let roster = resolve_roster(
+        status,
+        &swarm.roster_pubkeys_hex,
+        state.cluster_map.as_ref(),
+    )?;
+    let online_slots = ping_all_slots(&roster, local_slot, epoch).await?;
+    let is_aggregator = online_slots
+        .iter()
+        .next()
+        .map_or(false, |&slot| find_hosted(state, status, slot).is_some());
+    if is_aggregator {
+        let report = execute_aggregator_cycle(state, epoch, None).await?;
+        println!(
+            "EPOCH_SETTLED node_id={} swarm={} epoch={} aggregator_slot={} online_slots={} repaired_slots={:?}",
+            state.node_id,
+            report.swarm_id,
+            report.epoch,
+            report.aggregator_slot,
+            report.online_slots,
+            report.repaired_slots
+        );
+    }
+    Ok(())
+}
+
+async fn auto_epoch_loop(state: Arc<StorageRuntimeState>, interval: Duration) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut submitted_fault_proofs = BTreeSet::new();
+    loop {
+        ticker.tick().await;
+        let status = match fetch_l1_status(&state.l1_rpc_url).await {
+            Ok(status) => status,
+            Err(e) => {
+                eprintln!(
+                    "auto epoch: node {} status fetch failed: {e}",
+                    state.node_id
+                );
+                continue;
+            }
+        };
+        let results = [
+            (
+                "fault proof",
+                submit_pending_fault_proofs(&state, &status, &mut submitted_fault_proofs).await,
+            ),
+            ("handoff", handoff_to_replaced_nodes(&state, &status).await),
+            (
+                "epoch cycle",
+                run_epoch_if_aggregator(&state, &status).await,
+            ),
+        ];
+        for (step, result) in results {
+            if let Err(e) = result {
+                eprintln!("auto epoch: node {} {step} failed: {e}", state.node_id);
+            }
+        }
+    }
+}
+
 async fn execute_aggregator_cycle(
     state: &StorageRuntimeState,
     epoch: u64,
@@ -989,7 +1184,7 @@ async fn execute_aggregator_cycle(
     .await?;
 
     manifest.root_hex = hex::encode(new_blobs_root);
-    manifest.roster_pubkeys_hex = swarm.roster_pubkeys_hex.clone();
+    sync_manifest_roster(&mut manifest, &swarm.roster_pubkeys_hex);
     manifest.slot_fps_hex = new_fps
         .iter()
         .map(|s| hex::encode(scalar_to_bytes(s)))
@@ -997,19 +1192,13 @@ async fn execute_aggregator_cycle(
     manifest.slot_proofs_hex = new_proofs.iter().map(hex::encode).collect();
     NodeStorage::save_manifest(&state.data_dir, &manifest)?;
 
-    // 살아있는 피어 노드들에 갱신된 매니페스트 동기화
-    let unique_online_addrs: BTreeSet<SocketAddr> = online_slots
-        .iter()
-        .map(|&slot| roster[slot as usize].p2p_addr)
-        .collect();
-    let mut sync_set = JoinSet::new();
-    for addr in unique_online_addrs {
-        let m_clone = manifest.clone();
-        sync_set.spawn(async move {
-            let _ = send_p2p(addr, &P2pRequest::StoreManifest { manifest: m_clone }).await;
-        });
-    }
-    while sync_set.join_next().await.is_some() {}
+    broadcast_manifest(
+        &manifest,
+        online_slots
+            .iter()
+            .map(|&slot| roster[slot as usize].p2p_addr),
+    )
+    .await;
 
     let repaired_slots = repair_log.iter().map(|r| r.repaired_slot).collect();
     let bonus = block
@@ -1030,4 +1219,56 @@ async fn execute_aggregator_cycle(
         block_height: block.header.height,
         aggregator_bonus: bonus,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manifest(roster: &[&str], custodians: &[(u8, u8)]) -> SwarmManifestDto {
+        SwarmManifestDto {
+            swarm_id: 0,
+            object_id_hex: "ab".into(),
+            root_hex: String::new(),
+            roster_pubkeys_hex: roster.iter().map(|s| s.to_string()).collect(),
+            slot_fps_hex: Vec::new(),
+            slot_proofs_hex: Vec::new(),
+            custodian_owners: custodians.iter().copied().collect(),
+            slot_generations: BTreeMap::new(),
+        }
+    }
+
+    fn roster(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn plan_handoffs_selects_replaced_slots_held_by_local_custodian() {
+        let m = manifest(&["aa", "bb", "cc", "dd"], &[(0, 2), (1, 3), (3, 2)]);
+        let hosted = BTreeSet::from([2u8]);
+        let current = roster(&["AA", "b2", "cc", "d2"]);
+        assert_eq!(plan_handoffs(&m, &hosted, &current), vec![3]);
+    }
+
+    #[test]
+    fn plan_handoffs_ignores_unchanged_roster_and_foreign_custodians() {
+        let m = manifest(&["aa", "bb"], &[(0, 1)]);
+        assert!(plan_handoffs(&m, &BTreeSet::from([1u8]), &roster(&["AA", "bb"])).is_empty());
+        assert!(plan_handoffs(&m, &BTreeSet::from([0u8]), &roster(&["a2", "bb"])).is_empty());
+        assert!(plan_handoffs(&m, &BTreeSet::from([1u8]), &roster(&[])).is_empty());
+    }
+
+    #[test]
+    fn sync_manifest_roster_keeps_recorded_key_for_pending_custodian_slots() {
+        let mut m = manifest(&["aa", "bb", "cc"], &[(1, 2)]);
+        sync_manifest_roster(&mut m, &roster(&["a2", "b2", "c2"]));
+        assert_eq!(m.roster_pubkeys_hex, roster(&["a2", "bb", "c2"]));
+    }
+
+    #[test]
+    fn sync_manifest_roster_adopts_l1_roster_when_none_recorded() {
+        let mut m = manifest(&[], &[(1, 2)]);
+        sync_manifest_roster(&mut m, &roster(&["a2", "b2"]));
+        assert_eq!(m.roster_pubkeys_hex, roster(&["a2", "b2"]));
+    }
 }

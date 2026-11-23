@@ -7,6 +7,7 @@ use node_network::storage_daemon::{start_storage_daemon, PublicEndpoints, Storag
 use node_network::wire::SwarmClusterMapDto;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
 #[derive(Parser)]
 #[command(name = "depin-node", about = "DePIN Mobile Storage L1 & Storage Swarm Node Daemon")]
@@ -57,6 +58,8 @@ enum Command {
         ip_subnet_hash: u16,
         #[arg(long)]
         country_code: u8,
+        #[arg(long)]
+        auto_epoch_secs: Option<u64>,
     },
 }
 
@@ -116,6 +119,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 data_dir,
                 ip_subnet_hash,
                 country_code,
+                auto_epoch_secs,
             } => {
                 let map = match cluster_map {
                     Some(path) => Some(serde_json::from_slice::<SwarmClusterMapDto>(
@@ -142,6 +146,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ip_subnet_hash,
                     country_code,
                     kzg_seed: DEFAULT_KZG_SEED,
+                    auto_epoch_interval: auto_epoch_secs.map(Duration::from_secs),
                 })
                 .await?;
                 println!(
