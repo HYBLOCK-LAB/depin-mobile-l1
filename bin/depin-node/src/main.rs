@@ -38,7 +38,10 @@ enum Command {
         p2p: SocketAddr,
         #[arg(long)]
         rpc: SocketAddr,
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "L1 RPC URL; comma-separated list enables failover on connection failure"
+        )]
         l1_rpc: String,
         #[arg(long, required_unless_present = "auto_register")]
         cluster_map: Option<PathBuf>,

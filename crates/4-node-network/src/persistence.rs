@@ -1,18 +1,12 @@
-use crate::wire::{
-    decode_fixed_hex, FinalizedBlockDto, NodeAccountDto, ShardDto, SwarmManifestDto,
-    SwarmSummaryDto,
-};
+use crate::wire::{decode_fixed_hex, FinalizedBlockDto, ShardDto, SwarmManifestDto};
 use crate::{Error, Result};
-use l1_state_engine::consensus::BftEngine;
-use l1_state_engine::executor::Executor;
-use l1_state_engine::state_db::VirtualSwarmState;
 use p256::ecdsa::SigningKey;
 use rand::rngs::OsRng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use verkle_fountain::verkle_kzg::Kzg;
 
@@ -86,16 +80,6 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct L1SnapshotFile {
-    pub height: u64,
-    pub last_block_hash_hex: String,
-    pub epoch_seed_hex: String,
-    pub nodes: Vec<NodeAccountDto>,
-    pub standby_pool_hex: Vec<String>,
-    pub swarms: Vec<SwarmSummaryDto>,
-}
-
 pub struct ValidatorStorage;
 
 impl ValidatorStorage {
@@ -112,50 +96,6 @@ impl ValidatorStorage {
         Ok(kzg)
     }
 
-    pub fn save_snapshot(
-        data_dir: &Path,
-        bft: &BftEngine,
-        exec: &Executor,
-        epoch_seed: &[u8; 32],
-    ) -> Result<()> {
-        let nodes = exec
-            .db
-            .nodes
-            .iter()
-            .map(|(pk, acc)| NodeAccountDto::from_account(pk, acc))
-            .collect();
-        let standby_pool_hex = exec.db.standby_pool.iter().map(hex::encode).collect();
-        let swarms = exec
-            .db
-            .swarms
-            .iter()
-            .map(|(swarm_id, state)| {
-                let roster = exec
-                    .db
-                    .swarm_rosters
-                    .get(swarm_id)
-                    .map(|r| r.iter().map(hex::encode).collect())
-                    .unwrap_or_default();
-                SwarmSummaryDto {
-                    swarm_id: *swarm_id,
-                    state: state.clone(),
-                    roster_pubkeys_hex: roster,
-                }
-            })
-            .collect();
-
-        let snap = L1SnapshotFile {
-            height: bft.height,
-            last_block_hash_hex: hex::encode(bft.last_block_hash),
-            epoch_seed_hex: hex::encode(epoch_seed),
-            nodes,
-            standby_pool_hex,
-            swarms,
-        };
-        let bytes = serde_json::to_vec_pretty(&snap)?;
-        atomic_write(&data_dir.join("l1_snapshot.json"), &bytes)
-    }
-
     pub fn append_block_wal(data_dir: &Path, block: &FinalizedBlockDto) -> Result<()> {
         fs::create_dir_all(data_dir)?;
         let path = data_dir.join("blocks.jsonl");
@@ -166,43 +106,47 @@ impl ValidatorStorage {
         Ok(())
     }
 
-    pub fn load_snapshot(
-        data_dir: &Path,
-        bft: &mut BftEngine,
-        exec: &mut Executor,
-    ) -> Result<Option<[u8; 32]>> {
-        let path = data_dir.join("l1_snapshot.json");
+    pub fn truncate_corrupt_wal_tail(data_dir: &Path) -> Result<()> {
+        let path = data_dir.join("blocks.jsonl");
         if !path.exists() {
-            return Ok(None);
+            return Ok(());
         }
-        let bytes = fs::read(path)?;
-        let snap: L1SnapshotFile = serde_json::from_slice(&bytes)?;
-        bft.height = snap.height;
-        bft.last_block_hash = decode_fixed_hex::<32>(&snap.last_block_hash_hex)?;
-        let epoch_seed = decode_fixed_hex::<32>(&snap.epoch_seed_hex)?;
+        let content = fs::read(&path)?;
+        let body = content.strip_suffix(b"\n").unwrap_or(&content);
+        let start = body.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+        let tail = &body[start..];
+        if tail.is_empty() || serde_json::from_slice::<FinalizedBlockDto>(tail).is_ok() {
+            return Ok(());
+        }
+        eprintln!("blocks.jsonl: truncating corrupt last line at byte {start}");
+        OpenOptions::new()
+            .write(true)
+            .open(path)?
+            .set_len(start as u64)?;
+        Ok(())
+    }
 
-        exec.db.nodes.clear();
-        for dto in &snap.nodes {
-            let (pk, acc) = dto.to_account()?;
-            exec.db.nodes.insert(pk, acc);
+    pub fn read_blocks(
+        data_dir: &Path,
+        from_height: u64,
+        limit: usize,
+    ) -> Result<Vec<FinalizedBlockDto>> {
+        let path = data_dir.join("blocks.jsonl");
+        if !path.exists() {
+            return Ok(Vec::new());
         }
-        exec.db.standby_pool.clear();
-        for pk_hex in &snap.standby_pool_hex {
-            exec.db.standby_pool.push(decode_fixed_hex::<33>(pk_hex)?);
+        let mut blocks = Vec::new();
+        for line in BufReader::new(fs::File::open(path)?).lines() {
+            let block: FinalizedBlockDto = serde_json::from_str(&line?)?;
+            if block.header.height < from_height {
+                continue;
+            }
+            blocks.push(block);
+            if blocks.len() >= limit {
+                break;
+            }
         }
-        exec.db.swarms.clear();
-        exec.db.swarm_rosters.clear();
-        for sw in &snap.swarms {
-            let state: VirtualSwarmState = sw.state.clone();
-            exec.db.swarms.insert(sw.swarm_id, state);
-            let roster = sw
-                .roster_pubkeys_hex
-                .iter()
-                .map(|h| decode_fixed_hex::<33>(h))
-                .collect::<Result<Vec<_>>>()?;
-            exec.db.swarm_rosters.insert(sw.swarm_id, roster);
-        }
-        Ok(Some(epoch_seed))
+        Ok(blocks)
     }
 }
 
@@ -504,8 +448,8 @@ impl NodeStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use l1_state_engine::consensus::{ValidatorInfo, ValidatorSigner};
-    use l1_state_engine::executor::{sign_registration, ExecutorConfig};
+    use l1_state_engine::consensus::{BftEngine, ValidatorInfo, ValidatorSigner};
+    use l1_state_engine::executor::{sign_registration, Executor, ExecutorConfig};
     use l1_state_engine::state_db::NativeTransaction;
     use std::collections::BTreeMap;
     use verkle_fountain::fountain::encode;
@@ -536,7 +480,7 @@ mod tests {
     }
 
     #[test]
-    fn signing_key_and_validator_snapshot_persistence_roundtrip() {
+    fn signing_key_and_block_wal_persistence_roundtrip() {
         let dir = TempDir::new("val");
         let key_path = dir.path.join("validator_key.hex");
 
@@ -585,24 +529,79 @@ mod tests {
             )
             .unwrap();
 
-        ValidatorStorage::save_snapshot(&dir.path, &bft, &exec, &seed).unwrap();
-        ValidatorStorage::append_block_wal(
-            &dir.path,
-            &FinalizedBlockDto::from_block(&block, vec![], vec![]),
-        )
-        .unwrap();
-        assert!(dir.path.join("blocks.jsonl").exists());
+        let dto = FinalizedBlockDto::from_block(&block, vec![], vec![]);
+        ValidatorStorage::append_block_wal(&dir.path, &dto).unwrap();
+        ValidatorStorage::append_block_wal(&dir.path, &dto).unwrap();
 
-        let mut bft_restored = BftEngine::new(infos).unwrap();
-        let mut exec_restored = Executor::new(ExecutorConfig::default());
-        let loaded_seed =
-            ValidatorStorage::load_snapshot(&dir.path, &mut bft_restored, &mut exec_restored)
-                .unwrap();
-        assert_eq!(loaded_seed, Some(seed));
-        assert_eq!(bft_restored.height, 1);
-        assert_eq!(bft_restored.last_block_hash, bft.last_block_hash);
-        assert_eq!(exec_restored.db.nodes.len(), 1);
-        assert!(exec_restored.db.nodes.contains_key(&pk));
+        let all = ValidatorStorage::read_blocks(&dir.path, 0, usize::MAX).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].block_hash_hex, hex::encode(bft.last_block_hash));
+        assert_eq!(
+            ValidatorStorage::read_blocks(&dir.path, 2, usize::MAX)
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            ValidatorStorage::read_blocks(&dir.path, 1, 1)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(exec.db.nodes.contains_key(&pk));
+    }
+
+    fn sample_block_line() -> String {
+        let signers: Vec<ValidatorSigner> = (0..4)
+            .map(|id| ValidatorSigner::new(id, 1, deterministic_signing_key(900 + id)))
+            .collect();
+        let infos: Vec<ValidatorInfo> = signers.iter().map(|s| s.info()).collect();
+        let mut bft = BftEngine::new(infos).unwrap();
+        let mut exec = Executor::new(ExecutorConfig::default());
+        let kzg = Kzg::setup(7, &mut ChaCha8Rng::seed_from_u64(55));
+        let block = bft
+            .propose_and_finalize(
+                &mut exec,
+                &kzg,
+                0,
+                vec![],
+                [0x5Au8; 32],
+                &[&signers[0], &signers[1], &signers[2]],
+            )
+            .unwrap();
+        serde_json::to_string(&FinalizedBlockDto::from_block(&block, vec![], vec![])).unwrap()
+    }
+
+    #[test]
+    fn truncate_corrupt_wal_tail_drops_only_last_partial_line() {
+        let dir = TempDir::new("walrepair");
+        let line = sample_block_line();
+        let wal = dir.path.join("blocks.jsonl");
+        fs::write(&wal, format!("{line}\n{}", &line[..line.len() / 2])).unwrap();
+
+        ValidatorStorage::truncate_corrupt_wal_tail(&dir.path).unwrap();
+
+        assert_eq!(fs::read_to_string(&wal).unwrap(), format!("{line}\n"));
+        assert_eq!(
+            ValidatorStorage::read_blocks(&dir.path, 0, usize::MAX)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn corrupt_middle_wal_line_still_fails() {
+        let dir = TempDir::new("walmiddle");
+        let line = sample_block_line();
+        let wal = dir.path.join("blocks.jsonl");
+        let content = format!("{}\n{line}\n", &line[..line.len() / 2]);
+        fs::write(&wal, &content).unwrap();
+
+        ValidatorStorage::truncate_corrupt_wal_tail(&dir.path).unwrap();
+
+        assert_eq!(fs::read_to_string(&wal).unwrap(), content);
+        assert!(ValidatorStorage::read_blocks(&dir.path, 0, usize::MAX).is_err());
     }
 
     #[test]

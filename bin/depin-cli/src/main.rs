@@ -39,7 +39,10 @@ enum Command {
         chain_id: u64,
     },
     Status {
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "L1 RPC URL; comma-separated list enables failover on connection failure"
+        )]
         l1_rpc: String,
     },
     RegisterAll {
@@ -53,7 +56,10 @@ enum Command {
         l1_rpc: String,
     },
     Upload {
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "L1 RPC URL; comma-separated list enables failover on connection failure"
+        )]
         l1_rpc: String,
         #[arg(long)]
         cluster_map: Option<PathBuf>,
