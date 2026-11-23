@@ -1,8 +1,10 @@
 use crate::Result;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
-use verkle_fountain::verkle_kzg::{bytes_to_scalar, Kzg, KzgProof, KzgRoot, Scalar};
+use std::collections::{BTreeMap, BTreeSet};
+use verkle_fountain::verkle_kzg::{
+    bytes_to_scalar, digest_to_scalar, Kzg, KzgProof, KzgRoot, Scalar,
+};
 
 mod bytes48 {
     use super::*;
@@ -88,6 +90,12 @@ pub enum NativeTransaction {
         swarm_id: u64,
         amount: u128,
     },
+    RegisterObject {
+        swarm_id: u64,
+        object_id: [u8; 32],
+        object_root: [u8; 48],
+        bounty: u128,
+    },
     /// 6시간 에포크마다 스웜 어그리게이터(0번 슬롯 우선, 부재 시 차순위 승계)가 제출하는 체크포인트
     SubmitSwarmCheckpoint {
         swarm_id: u64,
@@ -111,6 +119,14 @@ pub enum NativeTransaction {
         signed_pong_receipt: [u8; 64], // 에포크 내 반장이 서명해 준 생존 확인 영수증
     },
     TriggerShuffle,
+}
+
+pub fn object_weight(swarm_id: u64, object_id: &[u8; 32]) -> Scalar {
+    let mut h = Sha256::new();
+    h.update(b"depin/obj-weight/v1");
+    h.update(swarm_id.to_le_bytes());
+    h.update(object_id);
+    digest_to_scalar(&h.finalize())
 }
 
 impl NativeTransaction {
@@ -270,6 +286,8 @@ pub struct EnshrinedSwarmDB {
     pub swarms: BTreeMap<u64, VirtualSwarmState>,
     /// [Off-chain Auxiliary Index] 스웜 ID -> 슬롯별 공개키 로스터 캐시 (KZG 멤버십 증명 생성·조회용)
     pub swarm_rosters: BTreeMap<u64, Vec<[u8; 33]>>,
+    /// [Off-chain Auxiliary Index] 스웜 ID -> 집계 루트에 등록된 파일 ID 집합
+    pub swarm_objects: BTreeMap<u64, BTreeSet<[u8; 32]>>,
     /// [Off-chain Auxiliary Index] 노드 공개키 -> 계정·스테이킹·보상·슬래싱 로컬 인덱스
     pub nodes: BTreeMap<[u8; 33], NodeAccount>,
     /// [Off-chain Auxiliary Index] 충원 대기 중인 예비 모바일 노드 공개키 풀

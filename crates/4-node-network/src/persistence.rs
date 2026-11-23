@@ -153,6 +153,12 @@ impl ValidatorStorage {
                     swarm_id: *swarm_id,
                     state: state.clone(),
                     roster_pubkeys_hex: roster,
+                    object_ids_hex: exec
+                        .db
+                        .swarm_objects
+                        .get(swarm_id)
+                        .map(|ids| ids.iter().map(hex::encode).collect())
+                        .unwrap_or_default(),
                     recent_settlements: Vec::new(),
                 }
             })
@@ -206,6 +212,7 @@ impl ValidatorStorage {
         }
         exec.db.swarms.clear();
         exec.db.swarm_rosters.clear();
+        exec.db.swarm_objects.clear();
         for sw in &snap.swarms {
             let state: VirtualSwarmState = sw.state.clone();
             exec.db.swarms.insert(sw.swarm_id, state);
@@ -215,6 +222,12 @@ impl ValidatorStorage {
                 .map(|h| decode_fixed_hex::<33>(h))
                 .collect::<Result<Vec<_>>>()?;
             exec.db.swarm_rosters.insert(sw.swarm_id, roster);
+            let objects = sw
+                .object_ids_hex
+                .iter()
+                .map(|h| decode_fixed_hex::<32>(h))
+                .collect::<Result<_>>()?;
+            exec.db.swarm_objects.insert(sw.swarm_id, objects);
         }
         Ok(Some(epoch_seed))
     }

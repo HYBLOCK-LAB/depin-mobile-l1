@@ -722,7 +722,7 @@ fn auto_shuffle_zero_tx_routing_and_multifile_upload_download_e2e() {
         assert_eq!(status.swarms[0].roster_pubkeys_hex, expected_roster);
         assert_eq!(status.height, 10);
 
-        // 2. bounty=0으로 서로 다른 2개 파일을 Zero-Tx P2P 업로드 (온체인 블록 높이 증가 없음)
+        // 2. 서로 다른 2개 파일을 RegisterObject로 등록 업로드 (파일당 온체인 블록 1개)
         let kzg = ValidatorStorage::load_or_create_kzg(
             &tmp.path.join("client_kzg"),
             MAX_SWARM_SIZE - 1,
@@ -737,12 +737,12 @@ fn auto_shuffle_zero_tx_routing_and_multifile_upload_download_e2e() {
             Some(&cluster_map),
             &kzg,
             &payload_a,
-            0,
+            5_000,
             101,
         )
         .await
         .expect("upload file A");
-        assert!(block_a.is_none());
+        assert_eq!(block_a.expect("register block A").header.height, 11);
         assert_eq!(manifest_a.swarm_id, 0);
 
         let (manifest_b, block_b) = upload_payload(
@@ -750,20 +750,29 @@ fn auto_shuffle_zero_tx_routing_and_multifile_upload_download_e2e() {
             Some(&cluster_map),
             &kzg,
             &payload_b,
-            0,
+            5_000,
             202,
         )
         .await
         .expect("upload file B");
-        assert!(block_b.is_none());
+        assert_eq!(block_b.expect("register block B").header.height, 12);
         assert_eq!(manifest_b.swarm_id, 0);
         assert_ne!(manifest_a.object_id_hex, manifest_b.object_id_hex);
 
         let status_after_uploads: L1StatusDto =
             http_request_json::<(), L1StatusDto>(&validators[0].rpc_url, "GET", "/status", None)
                 .await
-                .expect("status after zero-tx uploads");
-        assert_eq!(status_after_uploads.height, 10);
+                .expect("status after uploads");
+        assert_eq!(status_after_uploads.height, 12);
+        let mut registered = status_after_uploads.swarms[0].object_ids_hex.clone();
+        registered.sort();
+        let mut expected_ids = vec![
+            manifest_a.object_id_hex.clone(),
+            manifest_b.object_id_hex.clone(),
+        ];
+        expected_ids.sort();
+        assert_eq!(registered, expected_ids);
+        assert_ne!(status_after_uploads.swarms[0].state.active_blobs_root, [0u8; 48]);
 
         // 3. 두 번째 파일 업로드 후에도 파일 A와 파일 B 모두 개별 매니페스트 조회로 100% 복원
         let (decoded_a, count_a) = download_payload(
@@ -788,7 +797,7 @@ fn auto_shuffle_zero_tx_routing_and_multifile_upload_download_e2e() {
         assert!(count_b >= K);
         assert_eq!(decoded_b, payload_b);
 
-        // 4. 6대 다운 후 Zero-Tx 초기 루트([0u8; 48])에서 지연 복구 체크포인트 전이 검증
+        // 4. 6대 다운 후 두 파일의 집계 루트에서 지연 복구 체크포인트 전이 검증
         for _ in 0..DOWN_NODES {
             let h = storage_nodes.remove(0);
             h.shutdown().await;
@@ -800,10 +809,10 @@ fn auto_shuffle_zero_tx_routing_and_multifile_upload_download_e2e() {
             Some(&RunCycleReq { epoch: 1 }),
         )
         .await
-        .expect("run aggregator cycle from zero root");
+        .expect("run aggregator cycle over both objects");
         assert_eq!(report.aggregator_slot, DOWN_NODES as u8);
         assert_eq!(report.repaired_slots.len(), T_TARGET - T_REPAIR);
-        assert_eq!(report.block_height, 11);
+        assert_eq!(report.block_height, 13);
         assert_eq!(report.aggregator_bonus, 50);
 
         let status_after_cycle: L1StatusDto =

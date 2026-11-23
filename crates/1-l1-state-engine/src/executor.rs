@@ -2,7 +2,7 @@ use crate::shuffler::swarm_params;
 use crate::state_db::{
     compute_member_verkle_root, open_member_verkle_proof, verify_member_verkle_proof,
     EnshrinedSwarmDB, NativeTransaction, NodeAccount, VirtualSwarmState, DEFAULT_SWARM_BOUNTY,
-    DEFAULT_UPTIME_BPS, MAX_ENDPOINT_LEN, MAX_SWARM_SIZE, MIN_SWARM_SIZE,
+    DEFAULT_UPTIME_BPS, MAX_ENDPOINT_LEN, MAX_SWARM_SIZE, MIN_SWARM_SIZE, object_weight,
 };
 use crate::{Error, Result};
 use p256::ecdsa::{
@@ -12,7 +12,7 @@ use p256::ecdsa::{
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
-use verkle_fountain::verkle_kzg::{bytes_to_scalar, Kzg, KzgRoot, Scalar};
+use verkle_fountain::verkle_kzg::{bytes_to_scalar, identity_root, Kzg, KzgRoot, Scalar};
 
 #[derive(Clone, Debug)]
 pub struct ExecutorConfig {
@@ -379,6 +379,42 @@ impl Executor {
                     aggregator_bonus: 0,
                     slashed_amount: 0,
                     active_blobs_root: Some(swarm.active_blobs_root),
+                })
+            }
+
+            NativeTransaction::RegisterObject {
+                swarm_id,
+                object_id,
+                object_root,
+                bounty,
+            } => {
+                let swarm = self.db.swarms.get(&swarm_id).ok_or(Error::InvalidInput)?;
+                let objects = self.db.swarm_objects.entry(swarm_id).or_default();
+                if bounty == 0 || objects.contains(&object_id) {
+                    return Err(Error::InvalidInput);
+                }
+                let pool = swarm
+                    .storage_bounty_pool
+                    .checked_add(bounty)
+                    .ok_or(Error::InvalidInput)?;
+                let base = if swarm.active_blobs_root == [0u8; 48] {
+                    identity_root()
+                } else {
+                    swarm.active_blobs_root
+                };
+                let aggregate = kzg
+                    .combine_commitments(&base, &object_root, object_weight(swarm_id, &object_id))
+                    .map_err(|_| Error::InvalidInput)?;
+                objects.insert(object_id);
+                let swarm = self.db.swarms.get_mut(&swarm_id).expect("checked");
+                swarm.storage_bounty_pool = pool;
+                swarm.active_blobs_root = aggregate;
+                Ok(ExecutionReceipt {
+                    tx_kind: "RegisterObject",
+                    distributed_reward: 0,
+                    aggregator_bonus: 0,
+                    slashed_amount: 0,
+                    active_blobs_root: Some(aggregate),
                 })
             }
 
@@ -1069,6 +1105,49 @@ mod tests {
         )
         .unwrap();
         assert_eq!(exec.db.get_swarm(0).unwrap().storage_bounty_pool, before + 500);
+    }
+
+    #[test]
+    fn register_object_aggregates_roots_and_rejects_invalid_requests() {
+        let (mut exec, kzg, _keys, _roster, fps, _root, epoch_seed) = setup_swarm_executor();
+        exec.db.swarms.get_mut(&0).unwrap().active_blobs_root = [0u8; 48];
+        let fps_b: Vec<Scalar> = fps.iter().map(|f| *f + Scalar::from(11u64)).collect();
+        let (id_a, id_b) = ([0xA1u8; 32], [0xB2u8; 32]);
+        let register = |exec: &mut Executor, id: [u8; 32], v: &[Scalar], bounty: u128| {
+            exec.execute(
+                NativeTransaction::RegisterObject {
+                    swarm_id: 0,
+                    object_id: id,
+                    object_root: kzg.commit(v).unwrap(),
+                    bounty,
+                },
+                &kzg,
+                &epoch_seed,
+            )
+        };
+
+        let pool = exec.db.swarms[&0].storage_bounty_pool;
+        register(&mut exec, id_a, &fps, 300).unwrap();
+        register(&mut exec, id_b, &fps_b, 200).unwrap();
+
+        let (wa, wb) = (object_weight(0, &id_a), object_weight(0, &id_b));
+        let aggregate: Vec<Scalar> = fps.iter().zip(&fps_b).map(|(a, b)| wa * *a + wb * *b).collect();
+        assert_eq!(
+            exec.db.swarms[&0].active_blobs_root,
+            kzg.commit(&aggregate).unwrap()
+        );
+        assert_eq!(exec.db.swarms[&0].storage_bounty_pool, pool + 500);
+        assert_eq!(exec.db.swarm_objects[&0], BTreeSet::from([id_a, id_b]));
+
+        let before = exec.db.swarms[&0].active_blobs_root;
+        assert!(matches!(register(&mut exec, id_a, &fps, 100), Err(Error::InvalidInput)));
+        assert!(matches!(
+            register(&mut exec, [0xC3u8; 32], &fps, 0),
+            Err(Error::InvalidInput)
+        ));
+        assert_eq!(exec.db.swarms[&0].active_blobs_root, before);
+        assert_eq!(exec.db.swarms[&0].storage_bounty_pool, pool + 500);
+        assert!(!exec.db.swarm_objects[&0].contains(&[0xC3u8; 32]));
     }
 
     #[test]

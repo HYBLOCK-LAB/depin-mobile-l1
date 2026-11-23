@@ -217,23 +217,6 @@ pub async fn upload_payload(
     let root_hex = hex::encode(root);
 
     let swarm_id = target_swarm.swarm_id;
-    let maybe_block = if initial_bounty > 0 {
-        let tx = TxDto::from_native(&NativeTransaction::DepositStorageBounty {
-            swarm_id,
-            amount: initial_bounty,
-        });
-        Some(
-            http_request_json::<TxDto, FinalizedBlockDto>(
-                l1_rpc_url,
-                "POST",
-                "/tx/submit",
-                Some(&tx),
-            )
-            .await?,
-        )
-    } else {
-        None
-    };
 
     let manifest = SwarmManifestDto {
         swarm_id,
@@ -292,10 +275,30 @@ pub async fn upload_payload(
         res.map_err(|e| Error::Network(e.to_string()))??;
     }
 
+    let maybe_block = if initial_bounty > 0 {
+        let tx = TxDto::from_native(&NativeTransaction::RegisterObject {
+            swarm_id,
+            object_id,
+            object_root: root,
+            bounty: initial_bounty,
+        });
+        Some(
+            http_request_json::<TxDto, FinalizedBlockDto>(
+                l1_rpc_url,
+                "POST",
+                "/tx/submit",
+                Some(&tx),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+
     Ok((manifest, maybe_block))
 }
 
-async fn fetch_live_manifest(
+pub async fn fetch_live_manifest(
     rpc_urls: &BTreeSet<String>,
     object_id_hex: &str,
     preferred_node_rpc: Option<&str>,
@@ -526,6 +529,7 @@ mod tests {
                 lazy_repair_target: 0,
             },
             roster_pubkeys_hex: Vec::new(),
+            object_ids_hex: Vec::new(),
             recent_settlements: settlements
                 .into_iter()
                 .map(|(epoch, aggregator_slot, bitmap)| SettlementDto {

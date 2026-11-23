@@ -102,17 +102,22 @@ done
 
 "$CLI_BIN" register-all --l1-rpc "http://127.0.0.1:19110" --cluster-map "$CLUSTER_MAP"
 
-echo "[4/8] Generating 64KB sample file and uploading 10 F_p shards over TCP..."
-dd if=/dev/urandom of="$DEMO_DIR/sample.bin" bs=1024 count=64 2>/dev/null
-ORIG_SHA="$(shasum -a 256 "$DEMO_DIR/sample.bin" | awk '{print $1}')"
-UPLOAD_JSON="$("$CLI_BIN" upload \
-  --l1-rpc "http://127.0.0.1:19110" \
-  --cluster-map "$CLUSTER_MAP" \
-  --file "$DEMO_DIR/sample.bin" \
-  --bounty 5000 \
-  --kzg-cache-dir "$DEMO_DIR/cli_kzg")"
-echo "$UPLOAD_JSON"
-OBJECT_ID="$(echo "$UPLOAD_JSON" | grep object_id_hex | sed -E 's/.*"object_id_hex": *"([^"]+)".*/\1/')"
+echo "[4/8] Generating two sample files (64KB, 48KB) and uploading F_p shards over TCP..."
+UPLOAD_SIZES=(64 48)
+ORIG_SHAS=()
+OBJECT_IDS=()
+for i in 0 1; do
+  dd if=/dev/urandom of="$DEMO_DIR/sample_$i.bin" bs=1024 count="${UPLOAD_SIZES[$i]}" 2>/dev/null
+  ORIG_SHAS+=("$(shasum -a 256 "$DEMO_DIR/sample_$i.bin" | awk '{print $1}')")
+  UPLOAD_JSON="$("$CLI_BIN" upload \
+    --l1-rpc "http://127.0.0.1:19110" \
+    --cluster-map "$CLUSTER_MAP" \
+    --file "$DEMO_DIR/sample_$i.bin" \
+    --bounty 5000 \
+    --kzg-cache-dir "$DEMO_DIR/cli_kzg")"
+  echo "$UPLOAD_JSON"
+  OBJECT_IDS+=("$(echo "$UPLOAD_JSON" | grep object_id_hex | sed -E 's/.*"object_id_hex": *"([^"]+)".*/\1/')")
+done
 
 echo "[5/8] Killing validator #3 and 6 storage nodes (slots 0..5 offline -> 4 active <= T_repair 4)..."
 kill -9 "${VAL_PIDS[3]}" 2>/dev/null || true
@@ -158,21 +163,23 @@ PIDS+=("${VAL_PIDS[0]}")
 wait_health "http://127.0.0.1:19110"
 "$CLI_BIN" status --l1-rpc "http://127.0.0.1:19110"
 
-echo "[8/8] Downloading & decoding from 4 surviving nodes over TCP and checking SHA-256..."
-"$CLI_BIN" download \
-  --l1-rpc "http://127.0.0.1:19110" \
-  --cluster-map "$CLUSTER_MAP" \
-  --object-id "$OBJECT_ID" \
-  --node-rpc "http://127.0.0.1:19306" \
-  --out "$DEMO_DIR/recovered.bin"
+echo "[8/8] Downloading & decoding both files from 4 surviving nodes over TCP and checking SHA-256..."
+for i in 0 1; do
+  "$CLI_BIN" download \
+    --l1-rpc "http://127.0.0.1:19110" \
+    --cluster-map "$CLUSTER_MAP" \
+    --object-id "${OBJECT_IDS[$i]}" \
+    --node-rpc "http://127.0.0.1:19306" \
+    --out "$DEMO_DIR/recovered_$i.bin"
 
-REC_SHA="$(shasum -a 256 "$DEMO_DIR/recovered.bin" | awk '{print $1}')"
-echo "Original  SHA-256: $ORIG_SHA"
-echo "Recovered SHA-256: $REC_SHA"
+  REC_SHA="$(shasum -a 256 "$DEMO_DIR/recovered_$i.bin" | awk '{print $1}')"
+  echo "File $i Original  SHA-256: ${ORIG_SHAS[$i]}"
+  echo "File $i Recovered SHA-256: $REC_SHA"
 
-if [ "$ORIG_SHA" != "$REC_SHA" ]; then
-  echo "SHA-256 MISMATCH!" >&2
-  exit 1
-fi
+  if [ "${ORIG_SHAS[$i]}" != "$REC_SHA" ]; then
+    echo "SHA-256 MISMATCH on file $i!" >&2
+    exit 1
+  fi
+done
 
 echo "LIVE DEMO PASSED: Real multi-process BFT, TCP P2P lazy repair, disk persistence & full decode verified!"
