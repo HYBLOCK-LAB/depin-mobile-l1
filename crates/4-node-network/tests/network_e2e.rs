@@ -1,5 +1,7 @@
 use l1_state_engine::executor::{expected_sample_index, heartbeat_signing_bytes};
-use l1_state_engine::state_db::{compute_member_verkle_root, NativeTransaction, MAX_SWARM_SIZE};
+use l1_state_engine::state_db::{
+    compute_member_verkle_root, object_weight, NativeTransaction, MAX_SWARM_SIZE,
+};
 use node_network::client::{
     build_cluster_map, download_payload, register_cluster_batch_via_nodes,
     register_cluster_via_nodes, slots_for_node, upload_payload,
@@ -17,6 +19,7 @@ use p256::ecdsa::{signature::Signer, Signature};
 use serde::Serialize;
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
+use verkle_fountain::verkle_kzg::{bytes_to_scalar, scalar_to_bytes, Scalar};
 
 const NODE_COUNT: usize = 10;
 const K: usize = 2;
@@ -452,13 +455,24 @@ fn p2p_heartbeat_receipt_fault_proof_and_custodian_handoff_e2e() {
                 .await
                 .expect("get status");
         let epoch_seed = decode_fixed_hex::<32>(&status.epoch_seed_hex).expect("epoch seed");
-        let root_bytes = decode_fixed_hex::<48>(&manifest.root_hex).expect("root bytes");
+        let root_bytes = status.swarms[0].state.active_blobs_root;
+        let weight = object_weight(
+            0,
+            &decode_fixed_hex::<32>(&manifest.object_id_hex).expect("object id"),
+        );
+        let aggregate_fps: Vec<Scalar> = manifest
+            .slot_fps_hex
+            .iter()
+            .map(|h| {
+                weight * bytes_to_scalar(&decode_fixed_hex::<32>(h).expect("fp")).expect("scalar")
+            })
+            .collect();
+        assert_eq!(kzg.commit(&aggregate_fps).expect("commit"), root_bytes);
         let sample_index = expected_sample_index(&epoch_seed, 0, 1, NODE_COUNT);
-        let sample_eval =
-            decode_fixed_hex::<32>(&manifest.slot_fps_hex[sample_index as usize]).expect("eval");
-        let kzg_sample_proof =
-            decode_fixed_hex::<48>(&manifest.slot_proofs_hex[sample_index as usize])
-                .expect("proof");
+        let sample_eval = scalar_to_bytes(&aggregate_fps[sample_index as usize]);
+        let kzg_sample_proof = kzg
+            .open(&aggregate_fps, sample_index as usize)
+            .expect("proof");
         let malicious_bitmap = ((1u128 << NODE_COUNT) - 1) & !(1u128 << 1);
         let ckpt_msg = NativeTransaction::checkpoint_signing_bytes(
             0,
