@@ -139,11 +139,11 @@ async fn start_storage_nodes(
             start_storage_daemon(StorageDaemonConfig {
                 node_id: *node_id,
                 slots: slots_for_node(cluster_map, *node_id),
-                swarm_id: 0,
                 p2p_addr: *p2p_addr,
                 rpc_addr: *rpc_addr,
                 l1_rpc_url: net.rpc_url(0),
-                cluster_map: cluster_map.clone(),
+                cluster_map: Some(cluster_map.clone()),
+                auto_register: None,
                 data_dir: net.root.join(format!("storage_{node_id}")),
                 ip_subnet_hash: *node_id as u16,
                 country_code: (*node_id % 8) as u8,
@@ -248,7 +248,7 @@ fn restarted_validator_restores_settled_history_for_fault_proof() {
         .expect("client kzg");
         let payload: Vec<u8> = (0..8_192).map(|i| ((i * 17 + 5) % 251) as u8).collect();
         let (manifest, _) =
-            upload_payload(&net.rpc_url(0), &cluster_map, &kzg, &payload, 10_000, 902)
+            upload_payload(&net.rpc_url(0), Some(&cluster_map), &kzg, &payload, 10_000, 902)
                 .await
                 .expect("upload payload");
 

@@ -424,7 +424,15 @@ mod tests {
         let mut roster = Vec::with_capacity(N);
         for i in 0..N {
             let sk = SigningKey::random(&mut OsRng);
-            let (pk, sig) = sign_registration(&sk, exec.config.chain_id, i as u16, 1, 2_000);
+            let (pk, sig) = sign_registration(
+                &sk,
+                exec.config.chain_id,
+                i as u16,
+                1,
+                2_000,
+                "127.0.0.1:9000",
+                "127.0.0.1:9001",
+            );
             exec.execute(
                 NativeTransaction::RegisterMobileNode {
                     pubkey_p256: pk,
@@ -432,6 +440,8 @@ mod tests {
                     ip_subnet_hash: i as u16,
                     country_code: 1,
                     stake: 2_000,
+                    p2p_addr: "127.0.0.1:9000".into(),
+                    rpc_addr: "127.0.0.1:9001".into(),
                 },
                 &kzg,
                 &seed,

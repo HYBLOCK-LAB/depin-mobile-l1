@@ -3,7 +3,7 @@ use node_network::client::slots_for_node;
 use node_network::l1_daemon::{
     start_validator_daemon, ValidatorDaemonConfig, DEFAULT_EPOCH_SEED, DEFAULT_KZG_SEED,
 };
-use node_network::storage_daemon::{start_storage_daemon, StorageDaemonConfig};
+use node_network::storage_daemon::{start_storage_daemon, PublicEndpoints, StorageDaemonConfig};
 use node_network::wire::SwarmClusterMapDto;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -43,8 +43,14 @@ enum Command {
             help = "L1 RPC URL; comma-separated list enables failover on connection failure"
         )]
         l1_rpc: String,
+        #[arg(long, required_unless_present = "auto_register")]
+        cluster_map: Option<PathBuf>,
         #[arg(long)]
-        cluster_map: PathBuf,
+        auto_register: bool,
+        #[arg(long, requires = "auto_register")]
+        public_p2p: Option<SocketAddr>,
+        #[arg(long, requires = "auto_register")]
+        public_rpc: Option<SocketAddr>,
         #[arg(long)]
         data_dir: PathBuf,
         #[arg(long)]
@@ -104,22 +110,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 rpc,
                 l1_rpc,
                 cluster_map,
+                auto_register,
+                public_p2p,
+                public_rpc,
                 data_dir,
                 ip_subnet_hash,
                 country_code,
             } => {
-                let map_bytes = std::fs::read(&cluster_map)?;
-                let map: SwarmClusterMapDto = serde_json::from_slice(&map_bytes)?;
-                let slots = slots_for_node(&map, node_id);
-                let swarm_id = map.swarm_id;
+                let map = match cluster_map {
+                    Some(path) => Some(serde_json::from_slice::<SwarmClusterMapDto>(
+                        &std::fs::read(path)?,
+                    )?),
+                    None => None,
+                };
+                let slots = map
+                    .as_ref()
+                    .map(|map| slots_for_node(map, node_id))
+                    .unwrap_or_default();
                 let handle = start_storage_daemon(StorageDaemonConfig {
                     node_id,
-                    slots: slots.clone(),
-                    swarm_id,
+                    slots,
                     p2p_addr: p2p,
                     rpc_addr: rpc,
                     l1_rpc_url: l1_rpc,
                     cluster_map: map,
+                    auto_register: auto_register.then(|| PublicEndpoints {
+                        p2p_addr: public_p2p.unwrap_or(p2p),
+                        rpc_addr: public_rpc.unwrap_or(rpc),
+                    }),
                     data_dir,
                     ip_subnet_hash,
                     country_code,
@@ -127,8 +145,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 })
                 .await?;
                 println!(
-                    "STORAGE_READY node_id={} slots={:?} p2p={} rpc={}",
-                    handle.node_id, slots, handle.p2p_addr, handle.rpc_url
+                    "STORAGE_READY node_id={} p2p={} rpc={}",
+                    handle.node_id, handle.p2p_addr, handle.rpc_url
                 );
                 std::future::pending::<()>().await;
                 #[allow(unreachable_code)]

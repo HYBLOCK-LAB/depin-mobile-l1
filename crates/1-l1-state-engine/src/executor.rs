@@ -1,8 +1,8 @@
 use crate::shuffler::swarm_params;
 use crate::state_db::{
     compute_member_verkle_root, open_member_verkle_proof, verify_member_verkle_proof,
-    EnshrinedSwarmDB, NativeTransaction, NodeAccount, VirtualSwarmState, DEFAULT_UPTIME_BPS,
-    MAX_SWARM_SIZE, MIN_SWARM_SIZE,
+    EnshrinedSwarmDB, NativeTransaction, NodeAccount, VirtualSwarmState, DEFAULT_SWARM_BOUNTY,
+    DEFAULT_UPTIME_BPS, MAX_ENDPOINT_LEN, MAX_SWARM_SIZE, MIN_SWARM_SIZE,
 };
 use crate::{Error, Result};
 use p256::ecdsa::{
@@ -11,6 +11,7 @@ use p256::ecdsa::{
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::SocketAddr;
 use verkle_fountain::verkle_kzg::{bytes_to_scalar, Kzg, KzgRoot, Scalar};
 
 #[derive(Clone, Debug)]
@@ -65,15 +66,29 @@ pub fn registration_signing_bytes(
     ip_subnet_hash: u16,
     country_code: u8,
     stake: u128,
+    p2p_addr: &str,
+    rpc_addr: &str,
 ) -> Vec<u8> {
     let mut h = Sha256::new();
-    h.update(b"depin/register/v1");
+    h.update(b"depin/register/v2");
     h.update(chain_id.to_le_bytes());
     h.update(pubkey_p256);
     h.update(ip_subnet_hash.to_le_bytes());
     h.update([country_code]);
     h.update(stake.to_le_bytes());
+    for addr in [p2p_addr, rpc_addr] {
+        h.update((addr.len() as u16).to_le_bytes());
+        h.update(addr.as_bytes());
+    }
     h.finalize().to_vec()
+}
+
+fn validate_endpoint(addr: &str) -> Result<()> {
+    let parsed: SocketAddr = addr.parse().map_err(|_| Error::InvalidInput)?;
+    if addr.len() > MAX_ENDPOINT_LEN || parsed.ip().is_unspecified() {
+        return Err(Error::InvalidInput);
+    }
+    Ok(())
 }
 
 pub fn sign_registration(
@@ -82,6 +97,8 @@ pub fn sign_registration(
     ip_subnet_hash: u16,
     country_code: u8,
     stake: u128,
+    p2p_addr: &str,
+    rpc_addr: &str,
 ) -> ([u8; 33], [u8; 64]) {
     let pk: [u8; 33] = key
         .verifying_key()
@@ -89,7 +106,15 @@ pub fn sign_registration(
         .as_bytes()
         .try_into()
         .expect("33-byte compressed SEC1 P-256 key");
-    let msg = registration_signing_bytes(chain_id, &pk, ip_subnet_hash, country_code, stake);
+    let msg = registration_signing_bytes(
+        chain_id,
+        &pk,
+        ip_subnet_hash,
+        country_code,
+        stake,
+        p2p_addr,
+        rpc_addr,
+    );
     let sig: Signature = key.sign(&msg);
     (pk, sig.to_bytes().into())
 }
@@ -278,11 +303,15 @@ impl Executor {
                 ip_subnet_hash,
                 country_code,
                 stake,
+                p2p_addr,
+                rpc_addr,
             } => {
                 if stake < self.config.min_node_stake || self.db.nodes.contains_key(&pubkey_p256)
                 {
                     return Err(Error::InvalidInput);
                 }
+                validate_endpoint(&p2p_addr)?;
+                validate_endpoint(&rpc_addr)?;
                 let vk =
                     VerifyingKey::from_sec1_bytes(&pubkey_p256).map_err(|_| Error::BadSignature)?;
                 let sig =
@@ -293,6 +322,8 @@ impl Executor {
                     ip_subnet_hash,
                     country_code,
                     stake,
+                    &p2p_addr,
+                    &rpc_addr,
                 );
                 vk.verify(&msg, &sig).map_err(|_| Error::BadSignature)?;
 
@@ -307,12 +338,25 @@ impl Executor {
                         consecutive_offline_epochs: 0,
                         slashed: false,
                         ema_uptime_bps: DEFAULT_UPTIME_BPS,
+                        p2p_addr,
+                        rpc_addr,
                     },
                 );
                 self.db.standby_pool.push(pubkey_p256);
 
                 Ok(ExecutionReceipt {
                     tx_kind: "RegisterMobileNode",
+                    distributed_reward: 0,
+                    aggregator_bonus: 0,
+                    slashed_amount: 0,
+                    active_blobs_root: None,
+                })
+            }
+
+            NativeTransaction::TriggerShuffle => {
+                self.auto_shuffle_standby_swarms(kzg, epoch_seed, DEFAULT_SWARM_BOUNTY)?;
+                Ok(ExecutionReceipt {
+                    tx_kind: "TriggerShuffle",
                     distributed_reward: 0,
                     aggregator_bonus: 0,
                     slashed_amount: 0,
@@ -766,7 +810,15 @@ mod tests {
         let mut roster = Vec::with_capacity(n);
         for i in 0..n {
             let sk = key_for(i as u64);
-            let (pk, sig) = sign_registration(&sk, exec.config.chain_id, i as u16, 1, 2_000);
+            let (pk, sig) = sign_registration(
+                &sk,
+                exec.config.chain_id,
+                i as u16,
+                1,
+                2_000,
+                "127.0.0.1:9000",
+                "127.0.0.1:9001",
+            );
             exec.execute(
                 NativeTransaction::RegisterMobileNode {
                     pubkey_p256: pk,
@@ -774,6 +826,8 @@ mod tests {
                     ip_subnet_hash: i as u16,
                     country_code: 1,
                     stake: 2_000,
+                    p2p_addr: "127.0.0.1:9000".into(),
+                    rpc_addr: "127.0.0.1:9001".into(),
                 },
                 &kzg,
                 &epoch_seed,
@@ -843,7 +897,15 @@ mod tests {
 
         // (a) 최소 스테이킹 미달 거부
         let sk_low = key_for(1);
-        let (pk_low, sig_low) = sign_registration(&sk_low, exec.config.chain_id, 1, 1, 999);
+        let (pk_low, sig_low) = sign_registration(
+            &sk_low,
+            exec.config.chain_id,
+            1,
+            1,
+            999,
+            "127.0.0.1:9000",
+            "127.0.0.1:9001",
+        );
         let err_low = exec
             .execute(
                 NativeTransaction::RegisterMobileNode {
@@ -852,6 +914,8 @@ mod tests {
                     ip_subnet_hash: 1,
                     country_code: 1,
                     stake: 999,
+                    p2p_addr: "127.0.0.1:9000".into(),
+                    rpc_addr: "127.0.0.1:9001".into(),
                 },
                 &kzg,
                 &seed,
@@ -861,7 +925,15 @@ mod tests {
 
         // 정상 등록
         let sk = key_for(2);
-        let (pk, sig) = sign_registration(&sk, exec.config.chain_id, 2, 1, 1_500);
+        let (pk, sig) = sign_registration(
+            &sk,
+            exec.config.chain_id,
+            2,
+            1,
+            1_500,
+            "127.0.0.1:9000",
+            "127.0.0.1:9001",
+        );
         exec.execute(
             NativeTransaction::RegisterMobileNode {
                 pubkey_p256: pk,
@@ -869,6 +941,8 @@ mod tests {
                 ip_subnet_hash: 2,
                 country_code: 1,
                 stake: 1_500,
+                p2p_addr: "127.0.0.1:9000".into(),
+                rpc_addr: "127.0.0.1:9001".into(),
             },
             &kzg,
             &seed,
@@ -884,6 +958,8 @@ mod tests {
                     ip_subnet_hash: 2,
                     country_code: 1,
                     stake: 1_500,
+                    p2p_addr: "127.0.0.1:9000".into(),
+                    rpc_addr: "127.0.0.1:9001".into(),
                 },
                 &kzg,
                 &seed,
@@ -893,7 +969,15 @@ mod tests {
 
         // (c) 서명 후 stake 변조 및 서명 바이트 변조 거부
         let sk3 = key_for(3);
-        let (pk3, sig3) = sign_registration(&sk3, exec.config.chain_id, 3, 1, 1_500);
+        let (pk3, sig3) = sign_registration(
+            &sk3,
+            exec.config.chain_id,
+            3,
+            1,
+            1_500,
+            "127.0.0.1:9000",
+            "127.0.0.1:9001",
+        );
         let err_tampered_stake = exec
             .execute(
                 NativeTransaction::RegisterMobileNode {
@@ -902,6 +986,8 @@ mod tests {
                     ip_subnet_hash: 3,
                     country_code: 1,
                     stake: 2_000,
+                    p2p_addr: "127.0.0.1:9000".into(),
+                    rpc_addr: "127.0.0.1:9001".into(),
                 },
                 &kzg,
                 &seed,
@@ -919,6 +1005,8 @@ mod tests {
                     ip_subnet_hash: 3,
                     country_code: 1,
                     stake: 1_500,
+                    p2p_addr: "127.0.0.1:9000".into(),
+                    rpc_addr: "127.0.0.1:9001".into(),
                 },
                 &kzg,
                 &seed,
@@ -1372,8 +1460,15 @@ mod tests {
         // 기존 스웜 배정 완료 노드는 대기 풀에서 비운 뒤 신규 예비 노드 1대 등록
         exec.db.standby_pool.clear();
         let standby_sk = key_for(777);
-        let (standby_pk, standby_sig) =
-            sign_registration(&standby_sk, exec.config.chain_id, 250, 82, 3_000);
+        let (standby_pk, standby_sig) = sign_registration(
+            &standby_sk,
+            exec.config.chain_id,
+            250,
+            82,
+            3_000,
+            "127.0.0.1:9000",
+            "127.0.0.1:9001",
+        );
         exec.execute(
             NativeTransaction::RegisterMobileNode {
                 pubkey_p256: standby_pk,
@@ -1381,6 +1476,8 @@ mod tests {
                 ip_subnet_hash: 250,
                 country_code: 82,
                 stake: 3_000,
+                p2p_addr: "127.0.0.1:9000".into(),
+                rpc_addr: "127.0.0.1:9001".into(),
             },
             &kzg,
             &epoch_seed,
@@ -1510,7 +1607,15 @@ mod tests {
             let sk = key_for(i);
             let subnet = (i / 2) as u16;
             let country = (i % 8) as u8;
-            let (pk, sig) = sign_registration(&sk, exec.config.chain_id, subnet, country, 1_500);
+            let (pk, sig) = sign_registration(
+                &sk,
+                exec.config.chain_id,
+                subnet,
+                country,
+                1_500,
+                "127.0.0.1:9000",
+                "127.0.0.1:9001",
+            );
             exec.execute(
                 NativeTransaction::RegisterMobileNode {
                     pubkey_p256: pk,
@@ -1518,6 +1623,8 @@ mod tests {
                     ip_subnet_hash: subnet,
                     country_code: country,
                     stake: 1_500,
+                    p2p_addr: "127.0.0.1:9000".into(),
+                    rpc_addr: "127.0.0.1:9001".into(),
                 },
                 &kzg,
                 &epoch_seed,
@@ -1540,6 +1647,152 @@ mod tests {
             exec.db.swarms[&0].member_verkle_root,
             compute_member_verkle_root(&kzg, &exec.db.swarm_rosters[&0]).unwrap()
         );
+    }
+
+    fn register_with_endpoints(
+        exec: &mut Executor,
+        kzg: &Kzg,
+        seed: &[u8; 32],
+        sk: &SigningKey,
+        signed: (&str, &str),
+        submitted: (&str, &str),
+    ) -> Result<ExecutionReceipt> {
+        let (pk, sig) =
+            sign_registration(sk, exec.config.chain_id, 1, 1, 1_500, signed.0, signed.1);
+        exec.execute(
+            NativeTransaction::RegisterMobileNode {
+                pubkey_p256: pk,
+                hw_attestation_sig: sig,
+                ip_subnet_hash: 1,
+                country_code: 1,
+                stake: 1_500,
+                p2p_addr: submitted.0.into(),
+                rpc_addr: submitted.1.into(),
+            },
+            kzg,
+            seed,
+        )
+    }
+
+    #[test]
+    fn registration_rejects_tampered_and_invalid_endpoints() {
+        let mut rng = StdRng::seed_from_u64(3);
+        let kzg = Kzg::setup(4, &mut rng);
+        let mut exec = Executor::new(ExecutorConfig::default());
+        let seed = [0xAC; 32];
+        let sk = key_for(31);
+        let genuine = ("10.0.0.5:9000", "10.0.0.5:9001");
+
+        assert!(matches!(
+            register_with_endpoints(
+                &mut exec,
+                &kzg,
+                &seed,
+                &sk,
+                genuine,
+                ("10.0.0.6:9000", genuine.1)
+            ),
+            Err(Error::BadSignature)
+        ));
+        assert!(matches!(
+            register_with_endpoints(
+                &mut exec,
+                &kzg,
+                &seed,
+                &sk,
+                genuine,
+                (genuine.0, "10.0.0.6:9001")
+            ),
+            Err(Error::BadSignature)
+        ));
+        for bad in [
+            "",
+            "not-an-address",
+            "10.0.0.5",
+            "0.0.0.0:9000",
+            "[::]:9000",
+        ] {
+            assert!(matches!(
+                register_with_endpoints(
+                    &mut exec,
+                    &kzg,
+                    &seed,
+                    &sk,
+                    (bad, genuine.1),
+                    (bad, genuine.1)
+                ),
+                Err(Error::InvalidInput)
+            ));
+            assert!(matches!(
+                register_with_endpoints(
+                    &mut exec,
+                    &kzg,
+                    &seed,
+                    &sk,
+                    (genuine.0, bad),
+                    (genuine.0, bad)
+                ),
+                Err(Error::InvalidInput)
+            ));
+        }
+        assert!(exec.db.nodes.is_empty());
+
+        register_with_endpoints(&mut exec, &kzg, &seed, &sk, genuine, genuine).unwrap();
+        let pk = *exec.db.nodes.keys().next().unwrap();
+        assert_eq!(exec.db.nodes[&pk].p2p_addr, genuine.0);
+        assert_eq!(exec.db.nodes[&pk].rpc_addr, genuine.1);
+    }
+
+    #[test]
+    fn trigger_shuffle_forms_swarm_from_standby_pool() {
+        let mut rng = StdRng::seed_from_u64(9);
+        let kzg = Kzg::setup(MAX_SWARM_SIZE - 1, &mut rng);
+        let mut exec = Executor::new(ExecutorConfig::default());
+        let seed = [0xAD; 32];
+        let register = |exec: &mut Executor, i: u64| {
+            let sk = key_for(100 + i);
+            let (pk, sig) = sign_registration(
+                &sk,
+                exec.config.chain_id,
+                i as u16,
+                (i % 8) as u8,
+                1_500,
+                "127.0.0.1:9000",
+                "127.0.0.1:9001",
+            );
+            exec.execute(
+                NativeTransaction::RegisterMobileNode {
+                    pubkey_p256: pk,
+                    hw_attestation_sig: sig,
+                    ip_subnet_hash: i as u16,
+                    country_code: (i % 8) as u8,
+                    stake: 1_500,
+                    p2p_addr: "127.0.0.1:9000".into(),
+                    rpc_addr: "127.0.0.1:9001".into(),
+                },
+                &kzg,
+                &seed,
+            )
+            .unwrap();
+        };
+
+        for i in 0..MIN_SWARM_SIZE as u64 - 1 {
+            register(&mut exec, i);
+        }
+        let receipt = exec
+            .execute(NativeTransaction::TriggerShuffle, &kzg, &seed)
+            .unwrap();
+        assert_eq!(receipt.tx_kind, "TriggerShuffle");
+        assert!(exec.db.swarms.is_empty());
+        assert_eq!(exec.db.standby_pool.len(), MIN_SWARM_SIZE - 1);
+
+        register(&mut exec, MIN_SWARM_SIZE as u64 - 1);
+        assert!(exec.db.swarms.is_empty());
+        exec.execute(NativeTransaction::TriggerShuffle, &kzg, &seed)
+            .unwrap();
+        assert_eq!(exec.db.swarms.len(), 1);
+        assert_eq!(exec.db.swarm_rosters[&0].len(), MIN_SWARM_SIZE);
+        assert!(exec.db.standby_pool.is_empty());
     }
 
     #[test]

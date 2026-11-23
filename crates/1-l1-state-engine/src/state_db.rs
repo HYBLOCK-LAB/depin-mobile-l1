@@ -19,6 +19,8 @@ mod bytes48 {
 pub const MIN_SWARM_SIZE: usize = 10;
 pub const MAX_SWARM_SIZE: usize = 128;
 pub const DEFAULT_UPTIME_BPS: u16 = 7_500;
+pub const DEFAULT_SWARM_BOUNTY: u128 = 10_000;
+pub const MAX_ENDPOINT_LEN: usize = 64;
 
 /// L1 글로벌 상태 DB에 저장되는 가상 스웜 추상화 상태 객체 (고정 크기 148 Bytes)
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +81,8 @@ pub enum NativeTransaction {
         ip_subnet_hash: u16,
         country_code: u8,
         stake: u128,
+        p2p_addr: String,
+        rpc_addr: String,
     },
     DepositStorageBounty {
         swarm_id: u64,
@@ -106,6 +110,7 @@ pub enum NativeTransaction {
         aggregator_slot: u8,
         signed_pong_receipt: [u8; 64], // 에포크 내 반장이 서명해 준 생존 확인 영수증
     },
+    TriggerShuffle,
 }
 
 impl NativeTransaction {
@@ -148,6 +153,8 @@ pub struct NodeAccount {
     pub consecutive_offline_epochs: u32,
     pub slashed: bool,
     pub ema_uptime_bps: u16,
+    pub p2p_addr: String,
+    pub rpc_addr: String,
 }
 
 /// [비교 Baseline] 100대 노드의 개별 주소·슬롯·상태를 온체인에 각각 기록하는 레거시 상태 DB
@@ -377,6 +384,8 @@ mod tests {
                     consecutive_offline_epochs: 0,
                     slashed: false,
                     ema_uptime_bps: DEFAULT_UPTIME_BPS,
+                    p2p_addr: String::new(),
+                    rpc_addr: String::new(),
                 },
             );
         }
@@ -580,6 +589,8 @@ mod tests {
                     consecutive_offline_epochs: 0,
                     slashed,
                     ema_uptime_bps: DEFAULT_UPTIME_BPS,
+                    p2p_addr: String::new(),
+                    rpc_addr: String::new(),
                 },
             );
         }

@@ -13,7 +13,8 @@ use l1_state_engine::consensus::{
 };
 use l1_state_engine::executor::{Executor, ExecutorConfig};
 use l1_state_engine::state_db::{
-    compute_member_verkle_root, NativeTransaction, MAX_SWARM_SIZE, MIN_SWARM_SIZE,
+    compute_member_verkle_root, NativeTransaction, DEFAULT_SWARM_BOUNTY, MAX_SWARM_SIZE,
+    MIN_SWARM_SIZE,
 };
 use p256::ecdsa::SigningKey;
 use serde::Serialize;
@@ -174,7 +175,7 @@ fn execute_stage(
         receipts.push(staged.execute(native, kzg, epoch_seed)?);
     }
     if had_registration && staged.db.standby_pool.len() >= MIN_SWARM_SIZE {
-        staged.auto_shuffle_standby_swarms(kzg, epoch_seed, 10_000)?;
+        staged.auto_shuffle_standby_swarms(kzg, epoch_seed, DEFAULT_SWARM_BOUNTY)?;
     }
     Ok((staged, receipts))
 }
@@ -593,6 +594,7 @@ async fn handle_rpc_conn(
                 .collect();
             let status = L1StatusDto {
                 validator_id: guard.signer.id,
+                chain_id: guard.exec.config.chain_id,
                 height: guard.bft.height,
                 last_block_hash_hex: hex::encode(guard.bft.last_block_hash),
                 epoch_seed_hex: hex::encode(guard.epoch_seed),
@@ -645,6 +647,23 @@ async fn handle_rpc_conn(
                 write_http_json(&mut stream, 400, &ErrorResponse { error: e.to_string() }).await?
             }
         },
+        ("POST", "/swarm/shuffle") => {
+            match propose_and_finalize_distributed(state, Vec::new(), vec![TxDto::TriggerShuffle])
+                .await
+            {
+                Ok(block) => write_http_json(&mut stream, 200, &block).await?,
+                Err(e) => {
+                    write_http_json(
+                        &mut stream,
+                        400,
+                        &ErrorResponse {
+                            error: e.to_string(),
+                        },
+                    )
+                    .await?
+                }
+            }
+        }
         _ => {
             write_http_json(
                 &mut stream,

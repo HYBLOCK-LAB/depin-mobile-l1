@@ -52,7 +52,15 @@ fn setup_network_and_swarm() -> (
         let sk = test_signing_key(i as u64);
         let subnet = (i / 2) as u16;
         let country = (i % 8) as u8;
-        let (pk, sig) = sign_registration(&sk, exec.config.chain_id, subnet, country, 1_500);
+        let (pk, sig) = sign_registration(
+            &sk,
+            exec.config.chain_id,
+            subnet,
+            country,
+            1_500,
+            "127.0.0.1:9000",
+            "127.0.0.1:9001",
+        );
         descriptors.push(NodeDescriptor {
             pubkey_p256: pk,
             ip_subnet_hash: subnet,
@@ -64,6 +72,8 @@ fn setup_network_and_swarm() -> (
             ip_subnet_hash: subnet,
             country_code: country,
             stake: 1_500,
+            p2p_addr: "127.0.0.1:9000".into(),
+            rpc_addr: "127.0.0.1:9001".into(),
         });
         node_keys.push(sk);
     }
@@ -499,7 +509,15 @@ fn auto_shuffled_adaptive_swarm_aligns_onchain_and_fsm_parameters() {
         let sk = test_signing_key(700 + i as u64);
         let subnet = i as u16;
         let country = (i % 8) as u8;
-        let (pk, sig) = sign_registration(&sk, exec.config.chain_id, subnet, country, 1_500);
+        let (pk, sig) = sign_registration(
+            &sk,
+            exec.config.chain_id,
+            subnet,
+            country,
+            1_500,
+            "127.0.0.1:9000",
+            "127.0.0.1:9001",
+        );
         exec.execute(
             NativeTransaction::RegisterMobileNode {
                 pubkey_p256: pk,
@@ -507,6 +525,8 @@ fn auto_shuffled_adaptive_swarm_aligns_onchain_and_fsm_parameters() {
                 ip_subnet_hash: subnet,
                 country_code: country,
                 stake: 1_500,
+                p2p_addr: "127.0.0.1:9000".into(),
+                rpc_addr: "127.0.0.1:9001".into(),
             },
             &kzg,
             &epoch_seed,

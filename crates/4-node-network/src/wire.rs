@@ -184,6 +184,10 @@ pub enum TxDto {
         ip_subnet_hash: u16,
         country_code: u8,
         stake: u128,
+        #[serde(default)]
+        p2p_addr: String,
+        #[serde(default)]
+        rpc_addr: String,
     },
     DepositStorageBounty {
         swarm_id: u64,
@@ -209,6 +213,7 @@ pub enum TxDto {
         aggregator_slot: u8,
         signed_pong_receipt_hex: String,
     },
+    TriggerShuffle,
 }
 
 impl TxDto {
@@ -220,12 +225,16 @@ impl TxDto {
                 ip_subnet_hash,
                 country_code,
                 stake,
+                p2p_addr,
+                rpc_addr,
             } => Self::RegisterMobileNode {
                 pubkey_hex: hex::encode(pubkey_p256),
                 hw_attestation_sig_hex: hex::encode(hw_attestation_sig),
                 ip_subnet_hash: *ip_subnet_hash,
                 country_code: *country_code,
                 stake: *stake,
+                p2p_addr: p2p_addr.clone(),
+                rpc_addr: rpc_addr.clone(),
             },
             NativeTransaction::DepositStorageBounty { swarm_id, amount } => {
                 Self::DepositStorageBounty {
@@ -271,6 +280,7 @@ impl TxDto {
                 aggregator_slot: *aggregator_slot,
                 signed_pong_receipt_hex: hex::encode(signed_pong_receipt),
             },
+            NativeTransaction::TriggerShuffle => Self::TriggerShuffle,
         }
     }
 
@@ -282,12 +292,16 @@ impl TxDto {
                 ip_subnet_hash,
                 country_code,
                 stake,
+                p2p_addr,
+                rpc_addr,
             } => Ok(NativeTransaction::RegisterMobileNode {
                 pubkey_p256: decode_fixed_hex::<33>(pubkey_hex)?,
                 hw_attestation_sig: decode_fixed_hex::<64>(hw_attestation_sig_hex)?,
                 ip_subnet_hash: *ip_subnet_hash,
                 country_code: *country_code,
                 stake: *stake,
+                p2p_addr: p2p_addr.clone(),
+                rpc_addr: rpc_addr.clone(),
             }),
             Self::DepositStorageBounty { swarm_id, amount } => {
                 Ok(NativeTransaction::DepositStorageBounty {
@@ -344,6 +358,7 @@ impl TxDto {
                 aggregator_slot: *aggregator_slot,
                 signed_pong_receipt: decode_fixed_hex::<64>(signed_pong_receipt_hex)?,
             }),
+            Self::TriggerShuffle => Ok(NativeTransaction::TriggerShuffle),
         }
     }
 }
@@ -358,6 +373,10 @@ pub struct NodeAccountDto {
     pub consecutive_offline_epochs: u32,
     pub slashed: bool,
     pub ema_uptime_bps: u16,
+    #[serde(default)]
+    pub p2p_addr: String,
+    #[serde(default)]
+    pub rpc_addr: String,
 }
 
 impl NodeAccountDto {
@@ -371,6 +390,8 @@ impl NodeAccountDto {
             consecutive_offline_epochs: acc.consecutive_offline_epochs,
             slashed: acc.slashed,
             ema_uptime_bps: acc.ema_uptime_bps,
+            p2p_addr: acc.p2p_addr.clone(),
+            rpc_addr: acc.rpc_addr.clone(),
         }
     }
 
@@ -387,6 +408,8 @@ impl NodeAccountDto {
                 consecutive_offline_epochs: self.consecutive_offline_epochs,
                 slashed: self.slashed,
                 ema_uptime_bps: self.ema_uptime_bps,
+                p2p_addr: self.p2p_addr.clone(),
+                rpc_addr: self.rpc_addr.clone(),
             },
         ))
     }
@@ -538,6 +561,7 @@ pub struct SwarmSummaryDto {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct L1StatusDto {
     pub validator_id: u64,
+    pub chain_id: u64,
     pub height: u64,
     pub last_block_hash_hex: String,
     pub epoch_seed_hex: String,
@@ -937,6 +961,8 @@ mod tests {
                 ip_subnet_hash: 42,
                 country_code: 82,
                 stake: 5_000,
+                p2p_addr: "10.0.0.7:9000".into(),
+                rpc_addr: "10.0.0.7:9001".into(),
             },
             NativeTransaction::DepositStorageBounty {
                 swarm_id: 3,
@@ -980,6 +1006,7 @@ mod tests {
                 aggregator_slot: 0,
                 signed_pong_receipt: [0xDD; 64],
             },
+            NativeTransaction::TriggerShuffle,
         ];
 
         for tx in txs {

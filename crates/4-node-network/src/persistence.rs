@@ -1,6 +1,7 @@
 use crate::wire::{decode_fixed_hex, FinalizedBlockDto, ShardDto, SwarmManifestDto};
 use crate::{Error, Result};
 use p256::ecdsa::SigningKey;
+use rand::rngs::OsRng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use serde::{Deserialize, Serialize};
@@ -43,18 +44,28 @@ pub fn deterministic_signing_key(seed: u64) -> SigningKey {
     SigningKey::random(&mut rng)
 }
 
+fn load_signing_key(path: &Path) -> Result<SigningKey> {
+    let content = fs::read_to_string(path)?;
+    let raw =
+        hex::decode(content.trim()).map_err(|e| Error::Network(format!("invalid key hex: {e}")))?;
+    SigningKey::from_slice(&raw)
+        .map_err(|e| Error::Network(format!("invalid P-256 key bytes: {e}")))
+}
+
 pub fn load_or_create_signing_key(path: &Path, deterministic_seed: u64) -> Result<SigningKey> {
     if path.exists() {
-        let content = fs::read_to_string(path)?;
-        let raw = hex::decode(content.trim())
-            .map_err(|e| Error::Network(format!("invalid key hex: {e}")))?;
-        return SigningKey::from_slice(&raw)
-            .map_err(|e| Error::Network(format!("invalid P-256 key bytes: {e}")));
-    }
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        return load_signing_key(path);
     }
     let key = deterministic_signing_key(deterministic_seed);
+    atomic_write(path, hex::encode(key.to_bytes()).as_bytes())?;
+    Ok(key)
+}
+
+pub fn load_or_create_random_signing_key(path: &Path) -> Result<SigningKey> {
+    if path.exists() {
+        return load_signing_key(path);
+    }
+    let key = SigningKey::random(&mut OsRng);
     atomic_write(path, hex::encode(key.to_bytes()).as_bytes())?;
     Ok(key)
 }
@@ -490,7 +501,15 @@ mod tests {
         let seed = [0x5Au8; 32];
 
         let node_sk = deterministic_signing_key(12);
-        let (pk, sig) = sign_registration(&node_sk, exec.config.chain_id, 1, 82, 2_000);
+        let (pk, sig) = sign_registration(
+            &node_sk,
+            exec.config.chain_id,
+            1,
+            82,
+            2_000,
+            "127.0.0.1:9000",
+            "127.0.0.1:9001",
+        );
         let block = bft
             .propose_and_finalize(
                 &mut exec,
@@ -502,6 +521,8 @@ mod tests {
                     ip_subnet_hash: 1,
                     country_code: 82,
                     stake: 2_000,
+                    p2p_addr: "127.0.0.1:9000".into(),
+                    rpc_addr: "127.0.0.1:9001".into(),
                 }],
                 seed,
                 &[&signers[0], &signers[1], &signers[2]],
