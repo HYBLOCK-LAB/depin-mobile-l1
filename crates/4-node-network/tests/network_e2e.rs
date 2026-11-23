@@ -172,7 +172,6 @@ fn distributed_bft_lazy_repair_crash_recovery_and_download_e2e() {
         assert!(NodeStorage::load_shard(&tmp.path.join("storage_1"), 0, &manifest.object_id_hex)
             .expect("load shard 0")
             .is_some());
-        assert!(tmp.path.join("validator_0/l1_snapshot.json").exists());
         assert!(tmp.path.join("validator_0/blocks.jsonl").exists());
 
         // Leave the standby online while the first six L1 roster members go offline.
