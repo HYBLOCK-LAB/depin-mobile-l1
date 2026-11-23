@@ -18,6 +18,7 @@ use verkle_fountain::verkle_kzg::{bytes_to_scalar, scalar_to_bytes, KzgProof, Kz
 
 const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+pub const MAX_SYNC_BLOCKS: usize = 64;
 const IO_TIMEOUT: Duration = Duration::from_secs(60);
 const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -639,6 +640,9 @@ pub enum P2pRequest {
     BftCommit {
         block: FinalizedBlockDto,
     },
+    SyncBlocks {
+        from_height: u64,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -662,6 +666,9 @@ pub enum P2pResponse {
         prevote: Option<VoteDto>,
         precommit: Option<VoteDto>,
         reason: Option<String>,
+    },
+    Blocks {
+        blocks: Vec<FinalizedBlockDto>,
     },
     Ack {
         ok: bool,
@@ -720,21 +727,44 @@ pub fn parse_http_host_port(url: &str) -> Result<(String, String)> {
     Ok((host_port.to_string(), path.to_string()))
 }
 
+async fn connect_tcp(host_port: &str) -> Result<TcpStream> {
+    Ok(
+        tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(host_port))
+            .await
+            .map_err(|_| Error::Network(format!("http connect timeout to {host_port}")))??,
+    )
+}
+
 pub async fn http_request_json<B: Serialize, R: DeserializeOwned>(
     base_url: &str,
     method: &str,
     path: &str,
     body: Option<&B>,
 ) -> Result<R> {
-    let (host_port, _) = parse_http_host_port(base_url)?;
-    let mut stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&host_port))
-        .await
-        .map_err(|_| Error::Network(format!("http connect timeout to {host_port}")))??;
-
     let body_bytes = match body {
         Some(b) => serde_json::to_vec(b)?,
         None => Vec::new(),
     };
+    let mut last_connect_err = Error::Network("empty l1 rpc url list".into());
+    for url in base_url.split(',').map(str::trim).filter(|u| !u.is_empty()) {
+        let (host_port, _) = parse_http_host_port(url)?;
+        match connect_tcp(&host_port).await {
+            Ok(stream) => {
+                return http_exchange(stream, &host_port, method, path, &body_bytes).await
+            }
+            Err(e) => last_connect_err = e,
+        }
+    }
+    Err(last_connect_err)
+}
+
+async fn http_exchange<R: DeserializeOwned>(
+    mut stream: TcpStream,
+    host_port: &str,
+    method: &str,
+    path: &str,
+    body_bytes: &[u8],
+) -> Result<R> {
     let req = format!(
         "{method} {path} HTTP/1.1\r\nHost: {host_port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body_bytes.len()
@@ -742,7 +772,7 @@ pub async fn http_request_json<B: Serialize, R: DeserializeOwned>(
     tokio::time::timeout(IO_TIMEOUT, async {
         stream.write_all(req.as_bytes()).await?;
         if !body_bytes.is_empty() {
-            stream.write_all(&body_bytes).await?;
+            stream.write_all(body_bytes).await?;
         }
         stream.flush().await
     })
@@ -1144,5 +1174,69 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    async fn closed_url() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        format!("http://{addr}")
+    }
+
+    async fn status_server(
+        status: u16,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let task = spawn_tcp_server(
+            listener,
+            Arc::clone(&hits),
+            move |mut stream, hits| async move {
+                read_http_request(&mut stream).await?;
+                hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                write_http_json(
+                    &mut stream,
+                    status,
+                    &serde_json::json!({"ok": status == 200}),
+                )
+                .await
+            },
+        );
+        (url, hits, task)
+    }
+
+    #[test]
+    fn http_request_json_falls_back_only_on_connect_failure() {
+        use std::sync::atomic::Ordering;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (ok_url, ok_hits, ok_task) = status_server(200).await;
+            let urls = format!("{}, {ok_url}", closed_url().await);
+            let reply: serde_json::Value = http_request_json::<(), _>(&urls, "GET", "/x", None)
+                .await
+                .unwrap();
+            assert_eq!(reply["ok"], true);
+            assert_eq!(ok_hits.load(Ordering::SeqCst), 1);
+
+            let (err_url, err_hits, err_task) = status_server(400).await;
+            let urls = format!("{err_url},{ok_url}");
+            let result = http_request_json::<(), serde_json::Value>(&urls, "GET", "/x", None).await;
+            assert!(result.is_err());
+            assert_eq!(err_hits.load(Ordering::SeqCst), 1);
+            assert_eq!(ok_hits.load(Ordering::SeqCst), 1);
+
+            let all_closed = format!("{},{}", closed_url().await, closed_url().await);
+            assert!(
+                http_request_json::<(), serde_json::Value>(&all_closed, "GET", "/x", None)
+                    .await
+                    .is_err()
+            );
+            ok_task.abort();
+            err_task.abort();
+        });
     }
 }
