@@ -1,17 +1,11 @@
-use crate::wire::{
-    decode_fixed_hex, FinalizedBlockDto, NodeAccountDto, ShardDto, SwarmManifestDto,
-    SwarmSummaryDto,
-};
+use crate::wire::{decode_fixed_hex, FinalizedBlockDto, ShardDto, SwarmManifestDto};
 use crate::{Error, Result};
-use l1_state_engine::consensus::BftEngine;
-use l1_state_engine::executor::Executor;
-use l1_state_engine::state_db::VirtualSwarmState;
 use p256::ecdsa::SigningKey;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use verkle_fountain::verkle_kzg::Kzg;
 
@@ -75,16 +69,6 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct L1SnapshotFile {
-    pub height: u64,
-    pub last_block_hash_hex: String,
-    pub epoch_seed_hex: String,
-    pub nodes: Vec<NodeAccountDto>,
-    pub standby_pool_hex: Vec<String>,
-    pub swarms: Vec<SwarmSummaryDto>,
-}
-
 pub struct ValidatorStorage;
 
 impl ValidatorStorage {
@@ -101,50 +85,6 @@ impl ValidatorStorage {
         Ok(kzg)
     }
 
-    pub fn save_snapshot(
-        data_dir: &Path,
-        bft: &BftEngine,
-        exec: &Executor,
-        epoch_seed: &[u8; 32],
-    ) -> Result<()> {
-        let nodes = exec
-            .db
-            .nodes
-            .iter()
-            .map(|(pk, acc)| NodeAccountDto::from_account(pk, acc))
-            .collect();
-        let standby_pool_hex = exec.db.standby_pool.iter().map(hex::encode).collect();
-        let swarms = exec
-            .db
-            .swarms
-            .iter()
-            .map(|(swarm_id, state)| {
-                let roster = exec
-                    .db
-                    .swarm_rosters
-                    .get(swarm_id)
-                    .map(|r| r.iter().map(hex::encode).collect())
-                    .unwrap_or_default();
-                SwarmSummaryDto {
-                    swarm_id: *swarm_id,
-                    state: state.clone(),
-                    roster_pubkeys_hex: roster,
-                }
-            })
-            .collect();
-
-        let snap = L1SnapshotFile {
-            height: bft.height,
-            last_block_hash_hex: hex::encode(bft.last_block_hash),
-            epoch_seed_hex: hex::encode(epoch_seed),
-            nodes,
-            standby_pool_hex,
-            swarms,
-        };
-        let bytes = serde_json::to_vec_pretty(&snap)?;
-        atomic_write(&data_dir.join("l1_snapshot.json"), &bytes)
-    }
-
     pub fn append_block_wal(data_dir: &Path, block: &FinalizedBlockDto) -> Result<()> {
         fs::create_dir_all(data_dir)?;
         let path = data_dir.join("blocks.jsonl");
@@ -155,43 +95,27 @@ impl ValidatorStorage {
         Ok(())
     }
 
-    pub fn load_snapshot(
+    pub fn read_blocks(
         data_dir: &Path,
-        bft: &mut BftEngine,
-        exec: &mut Executor,
-    ) -> Result<Option<[u8; 32]>> {
-        let path = data_dir.join("l1_snapshot.json");
+        from_height: u64,
+        limit: usize,
+    ) -> Result<Vec<FinalizedBlockDto>> {
+        let path = data_dir.join("blocks.jsonl");
         if !path.exists() {
-            return Ok(None);
+            return Ok(Vec::new());
         }
-        let bytes = fs::read(path)?;
-        let snap: L1SnapshotFile = serde_json::from_slice(&bytes)?;
-        bft.height = snap.height;
-        bft.last_block_hash = decode_fixed_hex::<32>(&snap.last_block_hash_hex)?;
-        let epoch_seed = decode_fixed_hex::<32>(&snap.epoch_seed_hex)?;
-
-        exec.db.nodes.clear();
-        for dto in &snap.nodes {
-            let (pk, acc) = dto.to_account()?;
-            exec.db.nodes.insert(pk, acc);
+        let mut blocks = Vec::new();
+        for line in BufReader::new(fs::File::open(path)?).lines() {
+            let block: FinalizedBlockDto = serde_json::from_str(&line?)?;
+            if block.header.height < from_height {
+                continue;
+            }
+            blocks.push(block);
+            if blocks.len() >= limit {
+                break;
+            }
         }
-        exec.db.standby_pool.clear();
-        for pk_hex in &snap.standby_pool_hex {
-            exec.db.standby_pool.push(decode_fixed_hex::<33>(pk_hex)?);
-        }
-        exec.db.swarms.clear();
-        exec.db.swarm_rosters.clear();
-        for sw in &snap.swarms {
-            let state: VirtualSwarmState = sw.state.clone();
-            exec.db.swarms.insert(sw.swarm_id, state);
-            let roster = sw
-                .roster_pubkeys_hex
-                .iter()
-                .map(|h| decode_fixed_hex::<33>(h))
-                .collect::<Result<Vec<_>>>()?;
-            exec.db.swarm_rosters.insert(sw.swarm_id, roster);
-        }
-        Ok(Some(epoch_seed))
+        Ok(blocks)
     }
 }
 
@@ -493,8 +417,8 @@ impl NodeStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use l1_state_engine::consensus::{ValidatorInfo, ValidatorSigner};
-    use l1_state_engine::executor::{sign_registration, ExecutorConfig};
+    use l1_state_engine::consensus::{BftEngine, ValidatorInfo, ValidatorSigner};
+    use l1_state_engine::executor::{sign_registration, Executor, ExecutorConfig};
     use l1_state_engine::state_db::NativeTransaction;
     use std::collections::BTreeMap;
     use verkle_fountain::fountain::encode;
@@ -525,7 +449,7 @@ mod tests {
     }
 
     #[test]
-    fn signing_key_and_validator_snapshot_persistence_roundtrip() {
+    fn signing_key_and_block_wal_persistence_roundtrip() {
         let dir = TempDir::new("val");
         let key_path = dir.path.join("validator_key.hex");
 
@@ -564,24 +488,26 @@ mod tests {
             )
             .unwrap();
 
-        ValidatorStorage::save_snapshot(&dir.path, &bft, &exec, &seed).unwrap();
-        ValidatorStorage::append_block_wal(
-            &dir.path,
-            &FinalizedBlockDto::from_block(&block, vec![], vec![]),
-        )
-        .unwrap();
-        assert!(dir.path.join("blocks.jsonl").exists());
+        let dto = FinalizedBlockDto::from_block(&block, vec![], vec![]);
+        ValidatorStorage::append_block_wal(&dir.path, &dto).unwrap();
+        ValidatorStorage::append_block_wal(&dir.path, &dto).unwrap();
 
-        let mut bft_restored = BftEngine::new(infos).unwrap();
-        let mut exec_restored = Executor::new(ExecutorConfig::default());
-        let loaded_seed =
-            ValidatorStorage::load_snapshot(&dir.path, &mut bft_restored, &mut exec_restored)
-                .unwrap();
-        assert_eq!(loaded_seed, Some(seed));
-        assert_eq!(bft_restored.height, 1);
-        assert_eq!(bft_restored.last_block_hash, bft.last_block_hash);
-        assert_eq!(exec_restored.db.nodes.len(), 1);
-        assert!(exec_restored.db.nodes.contains_key(&pk));
+        let all = ValidatorStorage::read_blocks(&dir.path, 0, usize::MAX).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].block_hash_hex, hex::encode(bft.last_block_hash));
+        assert_eq!(
+            ValidatorStorage::read_blocks(&dir.path, 2, usize::MAX)
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            ValidatorStorage::read_blocks(&dir.path, 1, 1)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(exec.db.nodes.contains_key(&pk));
     }
 
     #[test]
