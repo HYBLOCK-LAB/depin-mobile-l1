@@ -833,7 +833,29 @@ async fn submit_pending_fault_proofs(
     Ok(())
 }
 
-async fn run_epoch_if_aggregator(state: &StorageRuntimeState, status: &L1StatusDto) -> Result<()> {
+#[derive(Default)]
+struct SettlementWatch {
+    seen: Option<(u64, u64)>,
+    stale_ticks: usize,
+}
+
+impl SettlementWatch {
+    fn observe(&mut self, swarm_id: u64, last_epoch_settled: u64) -> usize {
+        if self.seen == Some((swarm_id, last_epoch_settled)) {
+            self.stale_ticks += 1;
+        } else {
+            self.seen = Some((swarm_id, last_epoch_settled));
+            self.stale_ticks = 0;
+        }
+        self.stale_ticks
+    }
+}
+
+async fn run_epoch_if_aggregator(
+    state: &StorageRuntimeState,
+    status: &L1StatusDto,
+    watch: &mut SettlementWatch,
+) -> Result<()> {
     let (swarm_id, local_slot) = state
         .identities
         .iter()
@@ -846,29 +868,31 @@ async fn run_epoch_if_aggregator(state: &StorageRuntimeState, status: &L1StatusD
         .iter()
         .find(|s| s.swarm_id == swarm_id)
         .ok_or_else(|| Error::Network("swarm missing on L1".into()))?;
+    if usize::from(local_slot) > watch.observe(swarm_id, swarm.state.last_epoch_settled) {
+        return Ok(());
+    }
     let epoch = swarm.state.last_epoch_settled + 1;
-    let roster = resolve_roster(
+    let lower_slots: Vec<RosterMember> = resolve_roster(
         status,
         &swarm.roster_pubkeys_hex,
         state.cluster_map.as_ref(),
-    )?;
-    let online_slots = ping_all_slots(&roster, local_slot, epoch).await?;
-    let is_aggregator = online_slots
-        .iter()
-        .next()
-        .map_or(false, |&slot| find_hosted(state, status, slot).is_some());
-    if is_aggregator {
-        let report = execute_aggregator_cycle(state, epoch, None).await?;
-        println!(
-            "EPOCH_SETTLED node_id={} swarm={} epoch={} aggregator_slot={} online_slots={} repaired_slots={:?}",
-            state.node_id,
-            report.swarm_id,
-            report.epoch,
-            report.aggregator_slot,
-            report.online_slots,
-            report.repaired_slots
-        );
+    )?
+    .into_iter()
+    .filter(|member| member.slot < local_slot)
+    .collect();
+    if !ping_all_slots(&lower_slots, local_slot, epoch).await?.is_empty() {
+        return Ok(());
     }
+    let report = execute_aggregator_cycle(state, epoch, None).await?;
+    println!(
+        "EPOCH_SETTLED node_id={} swarm={} epoch={} aggregator_slot={} online_slots={} repaired_slots={:?}",
+        state.node_id,
+        report.swarm_id,
+        report.epoch,
+        report.aggregator_slot,
+        report.online_slots,
+        report.repaired_slots
+    );
     Ok(())
 }
 
@@ -876,6 +900,7 @@ async fn auto_epoch_loop(state: Arc<StorageRuntimeState>, interval: Duration) {
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut submitted_fault_proofs = BTreeSet::new();
+    let mut settlement_watch = SettlementWatch::default();
     loop {
         ticker.tick().await;
         let status = match fetch_l1_status(&state.l1_rpc_url).await {
@@ -896,7 +921,7 @@ async fn auto_epoch_loop(state: Arc<StorageRuntimeState>, interval: Duration) {
             ("handoff", handoff_to_replaced_nodes(&state, &status).await),
             (
                 "epoch cycle",
-                run_epoch_if_aggregator(&state, &status).await,
+                run_epoch_if_aggregator(&state, &status, &mut settlement_watch).await,
             ),
         ];
         for (step, result) in results {
@@ -1224,6 +1249,16 @@ async fn execute_aggregator_cycle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settlement_watch_counts_stale_ticks_and_resets_on_progress() {
+        let mut watch = SettlementWatch::default();
+        assert_eq!(watch.observe(0, 3), 0);
+        assert_eq!(watch.observe(0, 3), 1);
+        assert_eq!(watch.observe(0, 3), 2);
+        assert_eq!(watch.observe(0, 4), 0);
+        assert_eq!(watch.observe(1, 4), 0);
+    }
 
     fn manifest(roster: &[&str], custodians: &[(u8, u8)]) -> SwarmManifestDto {
         SwarmManifestDto {
