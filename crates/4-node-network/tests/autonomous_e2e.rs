@@ -1,6 +1,8 @@
 use l1_state_engine::executor::{expected_sample_index, heartbeat_signing_bytes};
 use l1_state_engine::shuffler::{swarm_params, swarm_sizes};
-use l1_state_engine::state_db::{NativeTransaction, DEFAULT_UPTIME_BPS, MAX_SWARM_SIZE};
+use l1_state_engine::state_db::{
+    object_weight, NativeTransaction, DEFAULT_UPTIME_BPS, MAX_SWARM_SIZE,
+};
 use node_network::client::{
     build_cluster_map, download_payload, register_cluster_batch_via_nodes,
     register_cluster_via_nodes, slots_for_node, upload_payload,
@@ -22,6 +24,7 @@ use std::collections::BTreeMap;
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+use verkle_fountain::verkle_kzg::{bytes_to_scalar, scalar_to_bytes, Scalar};
 
 const NODE_COUNT: usize = 10;
 const AUTO_EPOCH: Duration = Duration::from_secs(1);
@@ -269,13 +272,25 @@ fn victim_node_auto_submits_fault_proof_against_forged_attendance_e2e() {
 
         let status = l1_status(&l1_rpc).await;
         let epoch_seed = decode_fixed_hex::<32>(&status.epoch_seed_hex).expect("epoch seed");
-        let root = decode_fixed_hex::<48>(&manifest.root_hex).expect("root");
+        let root = status.swarms[0].state.active_blobs_root;
+        let weight = object_weight(
+            0,
+            &decode_fixed_hex::<32>(&manifest.object_id_hex).expect("object id"),
+        );
+        let aggregate_fps: Vec<Scalar> = manifest
+            .slot_fps_hex
+            .iter()
+            .map(|h| {
+                weight * bytes_to_scalar(&decode_fixed_hex::<32>(h).expect("fp")).expect("scalar")
+            })
+            .collect();
+        let kzg = client_kzg(&tmp);
+        assert_eq!(kzg.commit(&aggregate_fps).expect("commit"), root);
         let sample_index = expected_sample_index(&epoch_seed, 0, 1, NODE_COUNT);
-        let sample_eval =
-            decode_fixed_hex::<32>(&manifest.slot_fps_hex[sample_index as usize]).expect("eval");
-        let kzg_sample_proof =
-            decode_fixed_hex::<48>(&manifest.slot_proofs_hex[sample_index as usize])
-                .expect("proof");
+        let sample_eval = scalar_to_bytes(&aggregate_fps[sample_index as usize]);
+        let kzg_sample_proof = kzg
+            .open(&aggregate_fps, sample_index as usize)
+            .expect("proof");
         let forged_bitmap = ((1u128 << NODE_COUNT) - 1) & !(1u128 << 1);
         let ckpt_sig: Signature = agg_key.sign(&NativeTransaction::checkpoint_signing_bytes(
             0,

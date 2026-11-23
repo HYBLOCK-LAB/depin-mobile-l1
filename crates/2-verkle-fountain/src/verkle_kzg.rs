@@ -41,13 +41,22 @@ pub fn evaluation_point(object_id: &[u8; 32]) -> Scalar {
     let mut hasher = Sha256::new();
     hasher.update(b"depin/fp-eval-point/v1");
     hasher.update(object_id);
-    let digest = hasher.finalize();
-    let r = Scalar::from_le_bytes_mod_order(&digest);
+    digest_to_scalar(&hasher.finalize())
+}
+
+/// 해시 다이제스트를 0이 아닌 F_p 원소로 축약한다.
+pub fn digest_to_scalar(digest: &[u8]) -> Scalar {
+    let r = Scalar::from_le_bytes_mod_order(digest);
     if r == Scalar::ZERO {
         Scalar::ONE
     } else {
         r
     }
+}
+
+/// G1 항등원의 압축 직렬화 (결합 계산의 시작점)
+pub fn identity_root() -> KzgRoot {
+    g1_to_bytes(&G1Affine::zero())
 }
 
 /// 1단계 선형 동형 지문: fp(S) = sum_{j=0}^{m-1} symbols[j] * r^{j+1} mod p.
@@ -326,6 +335,25 @@ mod tests {
         let c_new = kzg.commit_fingerprint(fp_new);
         let c_expected = kzg.combine_commitments(&c_a, &c_b, beta).unwrap();
         assert_eq!(c_new, c_expected);
+    }
+
+    #[test]
+    fn kzg_commit_is_linear_over_value_vectors() {
+        let mut rng = ChaCha8Rng::seed_from_u64(77);
+        let kzg = Kzg::setup(15, &mut rng);
+        let v1: Vec<Scalar> = (0..16).map(|i| Scalar::from((i * 13 + 2) as u64)).collect();
+        let v2: Vec<Scalar> = (0..16).map(|i| Scalar::from((i * 29 + 9) as u64)).collect();
+        let l1 = digest_to_scalar(&[3u8; 32]);
+        let l2 = digest_to_scalar(&[5u8; 32]);
+
+        let mixed: Vec<Scalar> = v1.iter().zip(&v2).map(|(a, b)| l1 * *a + l2 * *b).collect();
+        let scaled_first = kzg
+            .combine_commitments(&identity_root(), &kzg.commit(&v1).unwrap(), l1)
+            .unwrap();
+        let aggregate = kzg
+            .combine_commitments(&scaled_first, &kzg.commit(&v2).unwrap(), l2)
+            .unwrap();
+        assert_eq!(kzg.commit(&mixed).unwrap(), aggregate);
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use crate::client::{
-    fault_proof_txs, fetch_l1_status, locate_node, resolve_roster, submit_native_tx, RosterMember,
+    fault_proof_txs, fetch_l1_status, fetch_live_manifest, locate_node, resolve_roster,
+    submit_native_tx, RosterMember,
 };
 use crate::l1_daemon::{DEFAULT_EPOCH_SEED, DEFAULT_KZG_SEED};
 use crate::persistence::{
@@ -10,7 +11,7 @@ use crate::wire::{
     decode_fixed_hex, http_request_json, proof_from_hex, read_frame, read_http_request,
     root_from_hex, send_p2p, spawn_tcp_server, write_frame, write_http_json, CycleReportDto,
     FinalizedBlockDto, L1StatusDto, P2pRequest, P2pResponse, ShardDto, SwarmClusterMapDto,
-    SwarmManifestDto, TxDto,
+    SwarmManifestDto, SwarmSummaryDto, TxDto,
 };
 use crate::{Error, Result};
 use l1_state_engine::executor::{
@@ -18,7 +19,9 @@ use l1_state_engine::executor::{
     heartbeat_signing_bytes, sign_registration,
 };
 use l1_state_engine::shuffler::score_node;
-use l1_state_engine::state_db::{NativeTransaction, RepairAuditProof, RepairEntry, MAX_SWARM_SIZE};
+use l1_state_engine::state_db::{
+    object_weight, NativeTransaction, RepairAuditProof, RepairEntry, MAX_SWARM_SIZE,
+};
 use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -31,7 +34,9 @@ use tokio::task::JoinSet;
 use tokio::time::MissedTickBehavior;
 use verkle_fountain::fountain::{rank, repair_local_field, Shard};
 use verkle_fountain::pollution_guard::{verify_homomorphic_repair, AuthenticatedShard};
-use verkle_fountain::verkle_kzg::{bytes_to_scalar, scalar_to_bytes, Kzg, KzgProof, Scalar};
+use verkle_fountain::verkle_kzg::{
+    bytes_to_scalar, scalar_to_bytes, Kzg, KzgProof, KzgRoot, Scalar,
+};
 
 const REGISTRATION_STAKE: u128 = 1_500;
 const NODE_KEY_FILE: &str = "node.hex";
@@ -108,8 +113,6 @@ struct ErrorResponse {
 #[derive(Deserialize)]
 struct RunCycleBody {
     epoch: u64,
-    #[serde(default)]
-    object_id_hex: Option<String>,
 }
 
 pub fn sorted_slot_keys(n: usize) -> Vec<(u64, SigningKey, [u8; 33])> {
@@ -563,7 +566,7 @@ async fn handle_storage_rpc(mut stream: TcpStream, state: Arc<StorageRuntimeStat
         ("POST", "/aggregator/run_cycle") => {
             let req: RunCycleBody = serde_json::from_slice(&body)
                 .map_err(|e| Error::Network(format!("invalid run_cycle json: {e}")))?;
-            match execute_aggregator_cycle(&state, req.epoch, req.object_id_hex.as_deref()).await {
+            match execute_aggregator_cycle(&state, req.epoch).await {
                 Ok(report) => write_http_json(&mut stream, 200, &report).await?,
                 Err(e) => {
                     write_http_json(&mut stream, 400, &ErrorResponse { error: e.to_string() })
@@ -672,33 +675,81 @@ async fn fetch_accessible_shards(
     Ok(out)
 }
 
-fn select_cycle_manifest(
+struct CycleObject {
+    manifest: SwarmManifestDto,
+    weight: Scalar,
+    root: KzgRoot,
+    fps: Vec<Scalar>,
+    new_fps: Vec<Scalar>,
+    proofs: Vec<KzgProof>,
+    shards: BTreeMap<usize, Shard>,
+}
+
+async fn load_cycle_objects(
     state: &StorageRuntimeState,
-    swarm_id: u64,
-    l1_status: &L1StatusDto,
-    requested_object_id: Option<&str>,
-) -> Result<SwarmManifestDto> {
-    if requested_object_id.is_some() {
-        return NodeStorage::load_manifest_for_object(&state.data_dir, requested_object_id)?
-            .ok_or_else(|| Error::Network("requested object manifest missing on node".into()));
-    }
-    if let Some(sw) = l1_status.swarms.iter().find(|s| s.swarm_id == swarm_id) {
-        if sw.state.active_blobs_root != [0u8; 48] {
-            let target_root_hex = hex::encode(sw.state.active_blobs_root);
-            if let Some(latest) = NodeStorage::load_manifest(&state.data_dir)? {
-                if latest.root_hex == target_root_hex {
-                    return Ok(latest);
-                }
-            }
-            for m in NodeStorage::list_manifests(&state.data_dir)? {
-                if m.root_hex == target_root_hex {
-                    return Ok(m);
-                }
-            }
+    swarm: &SwarmSummaryDto,
+    roster: &[RosterMember],
+) -> Result<Vec<CycleObject>> {
+    let n = roster.len();
+    let rpc_urls: BTreeSet<String> = roster
+        .iter()
+        .map(|member| format!("http://{}", member.rpc_addr))
+        .collect();
+    let mut objects = Vec::with_capacity(swarm.object_ids_hex.len());
+    for object_id_hex in &swarm.object_ids_hex {
+        let local = NodeStorage::load_manifest_for_object(&state.data_dir, Some(object_id_hex))?;
+        let manifest = match local {
+            Some(manifest) => manifest,
+            None => fetch_live_manifest(&rpc_urls, object_id_hex, None)
+                .await
+                .ok_or_else(|| {
+                    Error::Network(format!(
+                        "manifest for registered object {object_id_hex} not found"
+                    ))
+                })?,
+        };
+        if manifest.swarm_id != swarm.swarm_id {
+            return Err(Error::Network("manifest belongs to a different swarm".into()));
         }
+        let fps: Vec<Scalar> = manifest
+            .slot_fps_hex
+            .iter()
+            .map(|h| Ok(bytes_to_scalar(&decode_fixed_hex::<32>(h)?)?))
+            .collect::<Result<Vec<_>>>()?;
+        let proofs: Vec<KzgProof> = manifest
+            .slot_proofs_hex
+            .iter()
+            .map(|h| proof_from_hex(h))
+            .collect::<Result<Vec<_>>>()?;
+        if fps.len() != n || proofs.len() != n {
+            return Err(Error::Network("manifest length mismatch".into()));
+        }
+        objects.push(CycleObject {
+            weight: object_weight(swarm.swarm_id, &decode_fixed_hex::<32>(object_id_hex)?),
+            root: root_from_hex(&manifest.root_hex)?,
+            new_fps: fps.clone(),
+            fps,
+            proofs,
+            shards: BTreeMap::new(),
+            manifest,
+        });
     }
-    NodeStorage::load_manifest(&state.data_dir)?
-        .ok_or_else(|| Error::Network("swarm manifest missing on node".into()))
+    if objects.is_empty() {
+        return Err(Error::Network("no objects registered in swarm".into()));
+    }
+    Ok(objects)
+}
+
+fn aggregate_fps<'a>(
+    n: usize,
+    parts: impl Iterator<Item = (Scalar, &'a [Scalar])>,
+) -> Vec<Scalar> {
+    parts.fold(vec![Scalar::from(0u64); n], |mut acc, (weight, fps)| {
+        for (slot, fp) in acc.iter_mut().zip(fps) {
+            *slot += weight * *fp;
+        }
+        acc
+    })
 }
 
 fn sync_manifest_roster(manifest: &mut SwarmManifestDto, l1_roster: &[String]) {
@@ -833,7 +884,29 @@ async fn submit_pending_fault_proofs(
     Ok(())
 }
 
-async fn run_epoch_if_aggregator(state: &StorageRuntimeState, status: &L1StatusDto) -> Result<()> {
+#[derive(Default)]
+struct SettlementWatch {
+    seen: Option<(u64, u64)>,
+    stale_ticks: usize,
+}
+
+impl SettlementWatch {
+    fn observe(&mut self, swarm_id: u64, last_epoch_settled: u64) -> usize {
+        if self.seen == Some((swarm_id, last_epoch_settled)) {
+            self.stale_ticks += 1;
+        } else {
+            self.seen = Some((swarm_id, last_epoch_settled));
+            self.stale_ticks = 0;
+        }
+        self.stale_ticks
+    }
+}
+
+async fn run_epoch_if_aggregator(
+    state: &StorageRuntimeState,
+    status: &L1StatusDto,
+    watch: &mut SettlementWatch,
+) -> Result<()> {
     let (swarm_id, local_slot) = state
         .identities
         .iter()
@@ -846,29 +919,31 @@ async fn run_epoch_if_aggregator(state: &StorageRuntimeState, status: &L1StatusD
         .iter()
         .find(|s| s.swarm_id == swarm_id)
         .ok_or_else(|| Error::Network("swarm missing on L1".into()))?;
+    if usize::from(local_slot) > watch.observe(swarm_id, swarm.state.last_epoch_settled) {
+        return Ok(());
+    }
     let epoch = swarm.state.last_epoch_settled + 1;
-    let roster = resolve_roster(
+    let lower_slots: Vec<RosterMember> = resolve_roster(
         status,
         &swarm.roster_pubkeys_hex,
         state.cluster_map.as_ref(),
-    )?;
-    let online_slots = ping_all_slots(&roster, local_slot, epoch).await?;
-    let is_aggregator = online_slots
-        .iter()
-        .next()
-        .map_or(false, |&slot| find_hosted(state, status, slot).is_some());
-    if is_aggregator {
-        let report = execute_aggregator_cycle(state, epoch, None).await?;
-        println!(
-            "EPOCH_SETTLED node_id={} swarm={} epoch={} aggregator_slot={} online_slots={} repaired_slots={:?}",
-            state.node_id,
-            report.swarm_id,
-            report.epoch,
-            report.aggregator_slot,
-            report.online_slots,
-            report.repaired_slots
-        );
+    )?
+    .into_iter()
+    .filter(|member| member.slot < local_slot)
+    .collect();
+    if !ping_all_slots(&lower_slots, local_slot, epoch).await?.is_empty() {
+        return Ok(());
     }
+    let report = execute_aggregator_cycle(state, epoch).await?;
+    println!(
+        "EPOCH_SETTLED node_id={} swarm={} epoch={} aggregator_slot={} online_slots={} repaired_slots={:?}",
+        state.node_id,
+        report.swarm_id,
+        report.epoch,
+        report.aggregator_slot,
+        report.online_slots,
+        report.repaired_slots
+    );
     Ok(())
 }
 
@@ -876,6 +951,7 @@ async fn auto_epoch_loop(state: Arc<StorageRuntimeState>, interval: Duration) {
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut submitted_fault_proofs = BTreeSet::new();
+    let mut settlement_watch = SettlementWatch::default();
     loop {
         ticker.tick().await;
         let status = match fetch_l1_status(&state.l1_rpc_url).await {
@@ -896,7 +972,7 @@ async fn auto_epoch_loop(state: Arc<StorageRuntimeState>, interval: Duration) {
             ("handoff", handoff_to_replaced_nodes(&state, &status).await),
             (
                 "epoch cycle",
-                run_epoch_if_aggregator(&state, &status).await,
+                run_epoch_if_aggregator(&state, &status, &mut settlement_watch).await,
             ),
         ];
         for (step, result) in results {
@@ -910,7 +986,6 @@ async fn auto_epoch_loop(state: Arc<StorageRuntimeState>, interval: Duration) {
 async fn execute_aggregator_cycle(
     state: &StorageRuntimeState,
     epoch: u64,
-    object_id_hex: Option<&str>,
 ) -> Result<CycleReportDto> {
     let l1_status = fetch_l1_status(&state.l1_rpc_url).await?;
     let epoch_seed = decode_fixed_hex::<32>(&l1_status.epoch_seed_hex)?;
@@ -976,137 +1051,155 @@ async fn execute_aggregator_cycle(
     }
     while receipt_set.join_next().await.is_some() {}
 
-    let mut manifest = select_cycle_manifest(state, swarm_id, &l1_status, object_id_hex)?;
-    if manifest.swarm_id != swarm_id {
-        return Err(Error::Network("manifest belongs to a different swarm".into()));
+    let mut objects = load_cycle_objects(state, swarm, &roster).await?;
+    let old_fps = aggregate_fps(n, objects.iter().map(|o| (o.weight, o.fps.as_slice())));
+    let old_root = state.kzg.commit(&old_fps)?;
+    if old_root != swarm.state.active_blobs_root {
+        return Err(Error::Network(
+            "registered manifests do not match the L1 aggregate root".into(),
+        ));
     }
+    let old_proofs = state.kzg.open_all(&old_fps)?;
 
-    let old_root = root_from_hex(&manifest.root_hex)?;
-    let old_fps: Vec<Scalar> = manifest
-        .slot_fps_hex
-        .iter()
-        .map(|h| Ok(bytes_to_scalar(&decode_fixed_hex::<32>(h)?)?))
-        .collect::<Result<Vec<_>>>()?;
-    let old_proofs: Vec<KzgProof> = manifest
-        .slot_proofs_hex
-        .iter()
-        .map(|h| proof_from_hex(h))
-        .collect::<Result<Vec<_>>>()?;
-    if old_fps.len() != n || old_proofs.len() != n {
-        return Err(Error::Network("manifest length mismatch".into()));
+    for object in objects.iter_mut() {
+        object.shards = fetch_accessible_shards(
+            &roster,
+            &online_slots,
+            &object.manifest.custodian_owners,
+            &object.manifest.object_id_hex,
+        )
+        .await?
+        .into_iter()
+        .collect();
     }
-
-    let mut accessible = fetch_accessible_shards(
-        &roster,
-        &online_slots,
-        &manifest.custodian_owners,
-        &manifest.object_id_hex,
-    )
-    .await?;
-    let accessible_before = accessible.len();
-    let k = accessible
-        .first()
-        .map(|(_, s)| s.k)
+    let mut common: BTreeSet<usize> = objects[0].shards.keys().copied().collect();
+    for object in &objects[1..] {
+        common.retain(|slot| object.shards.contains_key(slot));
+    }
+    for object in objects.iter_mut() {
+        object.shards.retain(|slot, _| common.contains(slot));
+    }
+    let accessible_before = common.len();
+    let k = objects[0]
+        .shards
+        .values()
+        .next()
+        .map(|s| s.k)
         .ok_or_else(|| Error::Network("no accessible shards found".into()))?;
-
-    let rows: Vec<Vec<Scalar>> = accessible.iter().map(|(_, s)| s.coefficients.clone()).collect();
-    if rank(&rows, k) < k {
-        return Err(Error::Network("insufficient linear rank across live shards".into()));
+    for object in &objects {
+        let rows: Vec<Vec<Scalar>> = object
+            .shards
+            .values()
+            .map(|s| s.coefficients.clone())
+            .collect();
+        if rank(&rows, k) < k {
+            return Err(Error::Network("insufficient linear rank across live shards".into()));
+        }
     }
 
-    let mut new_fps = old_fps.clone();
     let mut repair_log: Vec<RepairEntry> = Vec::new();
     let online_vec: Vec<u8> = online_slots.iter().copied().collect();
 
     if accessible_before <= trigger {
-        let accessible_set: BTreeSet<usize> = accessible.iter().map(|(s, _)| *s).collect();
         let target_slots: Vec<u8> = (0..n)
-            .filter(|i| !accessible_set.contains(i))
+            .filter(|i| !common.contains(i))
             .map(|i| i as u8)
             .collect();
         let needed = target
             .saturating_sub(accessible_before)
             .min(target_slots.len());
-        let parent_pool = accessible.clone();
-        let m = parent_pool.len();
+        let parents: Vec<usize> = common.iter().copied().collect();
+        let m = parents.len();
 
         for idx in 0..needed {
-            let (pa, shard_a) = &parent_pool[idx % m];
+            let pa = parents[idx % m];
             let mut b_idx = (idx * 7 + 1 + idx / m) % m;
             if b_idx == idx % m {
                 b_idx = (idx % m + 1) % m;
             }
             for _ in 0..m {
-                if parent_pool[b_idx].1.coefficients != shard_a.coefficients {
+                let pb = parents[b_idx];
+                if objects
+                    .iter()
+                    .all(|o| o.shards[&pb].coefficients != o.shards[&pa].coefficients)
+                {
                     break;
                 }
                 b_idx = (b_idx + 1) % m;
             }
-            let (pb, shard_b) = &parent_pool[b_idx];
+            let pb = parents[b_idx];
             let factor_b = Scalar::from(idx as u64 + 2);
-
-            let repaired = repair_local_field(shard_a, shard_b, factor_b)?;
-            verify_homomorphic_repair(
-                &state.kzg,
-                &old_root,
-                AuthenticatedShard {
-                    shard: shard_a,
-                    index: *pa,
-                    proof: &old_proofs[*pa],
-                },
-                AuthenticatedShard {
-                    shard: shard_b,
-                    index: *pb,
-                    proof: &old_proofs[*pb],
-                },
-                factor_b,
-                &repaired,
-            )?;
-
             let target_slot = target_slots[idx];
             let custodian = online_vec[idx % online_vec.len()];
             let custodian_addr = roster[custodian as usize].p2p_addr;
 
-            let next_gen = manifest.slot_generations.get(&target_slot).copied().unwrap_or(0) + 1;
-            let store_reply = send_p2p(
-                custodian_addr,
-                &P2pRequest::StoreShard {
-                    slot: target_slot,
-                    is_custodian: true,
-                    generation: next_gen,
-                    shard: ShardDto::from_shard(&repaired),
-                    proof_hex: String::new(),
-                },
-            )
-            .await?;
-            match store_reply {
-                P2pResponse::StoreAck { ok: true, .. } => {}
-                other => {
-                    return Err(Error::Network(format!(
-                        "custodian StoreShard failed for slot {target_slot}: {other:?}"
-                    )));
-                }
-            }
+            for object in objects.iter_mut() {
+                let shard_a = &object.shards[&pa];
+                let shard_b = &object.shards[&pb];
+                let repaired = repair_local_field(shard_a, shard_b, factor_b)?;
+                verify_homomorphic_repair(
+                    &state.kzg,
+                    &object.root,
+                    AuthenticatedShard {
+                        shard: shard_a,
+                        index: pa,
+                        proof: &object.proofs[pa],
+                    },
+                    AuthenticatedShard {
+                        shard: shard_b,
+                        index: pb,
+                        proof: &object.proofs[pb],
+                    },
+                    factor_b,
+                    &repaired,
+                )?;
 
-            new_fps[target_slot as usize] = repaired.fingerprint();
-            manifest.custodian_owners.insert(target_slot, custodian);
-            manifest.slot_generations.insert(target_slot, next_gen);
+                let next_gen = object
+                    .manifest
+                    .slot_generations
+                    .get(&target_slot)
+                    .copied()
+                    .unwrap_or(0)
+                    + 1;
+                let store_reply = send_p2p(
+                    custodian_addr,
+                    &P2pRequest::StoreShard {
+                        slot: target_slot,
+                        is_custodian: true,
+                        generation: next_gen,
+                        shard: ShardDto::from_shard(&repaired),
+                        proof_hex: String::new(),
+                    },
+                )
+                .await?;
+                match store_reply {
+                    P2pResponse::StoreAck { ok: true, .. } => {}
+                    other => {
+                        return Err(Error::Network(format!(
+                            "custodian StoreShard failed for slot {target_slot}: {other:?}"
+                        )));
+                    }
+                }
+
+                object.new_fps[target_slot as usize] = repaired.fingerprint();
+                object.manifest.custodian_owners.insert(target_slot, custodian);
+                object.manifest.slot_generations.insert(target_slot, next_gen);
+                object.shards.insert(target_slot as usize, repaired);
+            }
             repair_log.push(RepairEntry {
                 repaired_slot: target_slot,
-                parent_slot_a: *pa as u8,
-                parent_slot_b: *pb as u8,
+                parent_slot_a: pa as u8,
+                parent_slot_b: pb as u8,
                 factor_b: scalar_to_bytes(&factor_b),
             });
-            accessible.push((target_slot as usize, repaired));
         }
     }
 
+    let new_fps = aggregate_fps(n, objects.iter().map(|o| (o.weight, o.new_fps.as_slice())));
     let (new_blobs_root, new_proofs) = if repair_log.is_empty() {
         (old_root, old_proofs.clone())
     } else {
-        let root = state.kzg.commit(&new_fps)?;
-        let proofs = state.kzg.open_all(&new_fps)?;
-        (root, proofs)
+        (state.kzg.commit(&new_fps)?, state.kzg.open_all(&new_fps)?)
     };
 
     let sample_index = expected_sample_index(&epoch_seed, swarm_id, epoch, n);
@@ -1183,22 +1276,31 @@ async fn execute_aggregator_cycle(
     )
     .await?;
 
-    manifest.root_hex = hex::encode(new_blobs_root);
-    sync_manifest_roster(&mut manifest, &swarm.roster_pubkeys_hex);
-    manifest.slot_fps_hex = new_fps
-        .iter()
-        .map(|s| hex::encode(scalar_to_bytes(s)))
-        .collect();
-    manifest.slot_proofs_hex = new_proofs.iter().map(hex::encode).collect();
-    NodeStorage::save_manifest(&state.data_dir, &manifest)?;
-
-    broadcast_manifest(
-        &manifest,
-        online_slots
+    for object in objects.iter_mut() {
+        if !repair_log.is_empty() {
+            object.manifest.root_hex = hex::encode(state.kzg.commit(&object.new_fps)?);
+            object.manifest.slot_proofs_hex = state
+                .kzg
+                .open_all(&object.new_fps)?
+                .iter()
+                .map(hex::encode)
+                .collect();
+        }
+        sync_manifest_roster(&mut object.manifest, &swarm.roster_pubkeys_hex);
+        object.manifest.slot_fps_hex = object
+            .new_fps
             .iter()
-            .map(|&slot| roster[slot as usize].p2p_addr),
-    )
-    .await;
+            .map(|s| hex::encode(scalar_to_bytes(s)))
+            .collect();
+        NodeStorage::save_manifest(&state.data_dir, &object.manifest)?;
+        broadcast_manifest(
+            &object.manifest,
+            online_slots
+                .iter()
+                .map(|&slot| roster[slot as usize].p2p_addr),
+        )
+        .await;
+    }
 
     let repaired_slots = repair_log.iter().map(|r| r.repaired_slot).collect();
     let bonus = block
@@ -1214,8 +1316,8 @@ async fn execute_aggregator_cycle(
         online_slots: online_slots.len(),
         accessible_shards_before: accessible_before,
         repaired_slots,
-        accessible_shards_after: accessible.len(),
-        new_blobs_root_hex: manifest.root_hex,
+        accessible_shards_after: common.len() + repair_log.len(),
+        new_blobs_root_hex: hex::encode(new_blobs_root),
         block_height: block.header.height,
         aggregator_bonus: bonus,
     })
@@ -1224,6 +1326,16 @@ async fn execute_aggregator_cycle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settlement_watch_counts_stale_ticks_and_resets_on_progress() {
+        let mut watch = SettlementWatch::default();
+        assert_eq!(watch.observe(0, 3), 0);
+        assert_eq!(watch.observe(0, 3), 1);
+        assert_eq!(watch.observe(0, 3), 2);
+        assert_eq!(watch.observe(0, 4), 0);
+        assert_eq!(watch.observe(1, 4), 0);
+    }
 
     fn manifest(roster: &[&str], custodians: &[(u8, u8)]) -> SwarmManifestDto {
         SwarmManifestDto {
