@@ -4,7 +4,7 @@ use crate::persistence::{
 use crate::wire::{
     decode_fixed_hex, read_frame, read_http_request, root_from_hex, send_p2p, spawn_tcp_server,
     write_frame, write_http_json, FinalizedBlockDto, InitSwarmRequest, L1StatusDto, NodeAccountDto,
-    P2pRequest, P2pResponse, SettlementDto, SwarmSummaryDto, TxDto, VoteDto,
+    P2pRequest, P2pResponse, SettlementDto, SwarmSummaryDto, TxDto, VoteDto, MAX_SYNC_BLOCKS,
 };
 use crate::{Error, Result};
 use l1_state_engine::consensus::{
@@ -48,6 +48,31 @@ struct ValidatorRuntimeState {
     epoch_seed: [u8; 32],
     data_dir: PathBuf,
     peer_p2p_addrs: Vec<SocketAddr>,
+}
+
+impl ValidatorRuntimeState {
+    fn install_block(&mut self, staged: Executor, finalized: FinalizedBlock) {
+        self.exec = staged;
+        self.bft.height = finalized.header.height;
+        self.bft.last_block_hash = finalized.block_hash;
+        self.bft.chain.push(finalized);
+    }
+
+    fn commit_block(
+        &mut self,
+        staged: Executor,
+        finalized: FinalizedBlock,
+        dto: &FinalizedBlockDto,
+    ) -> Result<()> {
+        ValidatorStorage::append_block_wal(&self.data_dir, dto)?;
+        self.install_block(staged, finalized);
+        Ok(())
+    }
+
+    fn apply_finalized_block(&mut self, block: &FinalizedBlockDto) -> Result<()> {
+        let (staged, finalized) = stage_finalized_block(&self.exec, &self.bft, &self.kzg, block)?;
+        self.commit_block(staged, finalized, block)
+    }
 }
 
 pub struct ValidatorDaemonHandle {
@@ -155,6 +180,104 @@ fn execute_stage(
     Ok((staged, receipts))
 }
 
+fn stage_finalized_block(
+    exec: &Executor,
+    bft: &BftEngine,
+    kzg: &Kzg,
+    block: &FinalizedBlockDto,
+) -> Result<(Executor, FinalizedBlock)> {
+    let header = BlockHeader::try_from(&block.header)?;
+    if header.height != bft.height + 1 {
+        return Err(Error::Network(format!(
+            "unexpected block height {}, current {}",
+            header.height, bft.height
+        )));
+    }
+    if header.prev_hash != bft.last_block_hash {
+        return Err(Error::Network(format!(
+            "prev_hash mismatch at height {}",
+            header.height
+        )));
+    }
+    let block_hash = decode_fixed_hex::<32>(&block.block_hash_hex)?;
+    if header.block_hash() != block_hash {
+        return Err(Error::Network(format!(
+            "block_hash mismatch at height {}",
+            header.height
+        )));
+    }
+    let precommits: Vec<Vote> = block
+        .precommits
+        .iter()
+        .map(Vote::try_from)
+        .collect::<Result<_>>()?;
+    bft.verify_quorum(
+        &precommits,
+        header.height,
+        &block_hash,
+        VotePhase::Precommit,
+    )?;
+    let (staged, receipts) = execute_stage(
+        exec,
+        kzg,
+        &header.epoch_seed,
+        &block.init_swarms,
+        &block.txs,
+    )?;
+    if compute_state_root(&staged) != header.state_root {
+        return Err(Error::Network("commit state_root mismatch".into()));
+    }
+    Ok((
+        staged,
+        FinalizedBlock {
+            header,
+            block_hash,
+            receipts,
+            precommits,
+        },
+    ))
+}
+
+async fn sync_blocks(state: &Arc<Mutex<ValidatorRuntimeState>>) {
+    loop {
+        let (from_height, peers) = {
+            let guard = state.lock().await;
+            (guard.bft.height + 1, guard.peer_p2p_addrs.clone())
+        };
+        let mut applied = false;
+        for peer in peers {
+            let Ok(P2pResponse::Blocks { blocks }) =
+                send_p2p(peer, &P2pRequest::SyncBlocks { from_height }).await
+            else {
+                continue;
+            };
+            let mut guard = state.lock().await;
+            for block in &blocks {
+                if block.header.height <= guard.bft.height {
+                    continue;
+                }
+                if guard.apply_finalized_block(block).is_err() {
+                    break;
+                }
+                applied = true;
+            }
+            if applied {
+                break;
+            }
+        }
+        if !applied {
+            return;
+        }
+    }
+}
+
+async fn sync_if_behind(state: &Arc<Mutex<ValidatorRuntimeState>>, target_height: u64) {
+    let behind = state.lock().await.bft.height + 1 < target_height;
+    if behind {
+        sync_blocks(state).await;
+    }
+}
+
 pub async fn start_validator_daemon(
     config: ValidatorDaemonConfig,
 ) -> Result<ValidatorDaemonHandle> {
@@ -168,12 +291,20 @@ pub async fn start_validator_daemon(
     let (infos, signer) =
         build_validator_set(config.validator_id, &config.validator_seeds, &key_path)?;
 
-    let mut exec = Executor::new(ExecutorConfig::default());
-    let mut bft = BftEngine::new(infos)?;
-    let mut epoch_seed = config.epoch_seed;
-    if let Some(loaded_seed) = ValidatorStorage::load_snapshot(&config.data_dir, &mut bft, &mut exec)?
-    {
-        epoch_seed = loaded_seed;
+    let mut runtime = ValidatorRuntimeState {
+        exec: Executor::new(ExecutorConfig::default()),
+        bft: BftEngine::new(infos)?,
+        signer,
+        kzg,
+        epoch_seed: config.epoch_seed,
+        data_dir: config.data_dir,
+        peer_p2p_addrs: config.peer_p2p_addrs,
+    };
+    ValidatorStorage::truncate_corrupt_wal_tail(&runtime.data_dir)?;
+    for block in ValidatorStorage::read_blocks(&runtime.data_dir, 0, usize::MAX)? {
+        let (staged, finalized) =
+            stage_finalized_block(&runtime.exec, &runtime.bft, &runtime.kzg, &block)?;
+        runtime.install_block(staged, finalized);
     }
 
     let p2p_listener = TcpListener::bind(config.p2p_addr).await?;
@@ -181,18 +312,11 @@ pub async fn start_validator_daemon(
     let actual_p2p = p2p_listener.local_addr()?;
     let actual_rpc = rpc_listener.local_addr()?;
 
-    let state = Arc::new(Mutex::new(ValidatorRuntimeState {
-        exec,
-        bft,
-        signer,
-        kzg,
-        epoch_seed,
-        data_dir: config.data_dir,
-        peer_p2p_addrs: config.peer_p2p_addrs,
-    }));
+    let state = Arc::new(Mutex::new(runtime));
 
     let p2p_task = spawn_tcp_server(p2p_listener, Arc::clone(&state), handle_p2p_conn);
-    let rpc_task = spawn_tcp_server(rpc_listener, state, handle_rpc_conn);
+    let rpc_task = spawn_tcp_server(rpc_listener, Arc::clone(&state), handle_rpc_conn);
+    sync_blocks(&state).await;
 
     Ok(ValidatorDaemonHandle {
         validator_id: config.validator_id,
@@ -215,6 +339,7 @@ async fn handle_p2p_conn(
             init_swarms,
             txs,
         } => {
+            sync_if_behind(&state, header.height).await;
             let guard = state.lock().await;
             let expected_height = guard.bft.height + 1;
             let parsed_header = BlockHeader::try_from(&header)?;
@@ -279,55 +404,24 @@ async fn handle_p2p_conn(
             }
         }
         P2pRequest::BftCommit { block } => {
+            sync_if_behind(&state, block.header.height).await;
             let mut guard = state.lock().await;
             if guard.bft.height >= block.header.height {
                 P2pResponse::Ack { ok: true }
-            } else if block.header.height != guard.bft.height + 1 {
-                P2pResponse::Error {
-                    message: format!(
-                        "unexpected block height {}, current {}",
-                        block.header.height, guard.bft.height
-                    ),
-                }
             } else {
-                let parsed_header = BlockHeader::try_from(&block.header)?;
-                let block_hash = decode_fixed_hex::<32>(&block.block_hash_hex)?;
-                let precommits: Vec<Vote> = block
-                    .precommits
-                    .iter()
-                    .map(Vote::try_from)
-                    .collect::<Result<Vec<_>>>()?;
-                guard.bft.verify_quorum(
-                    &precommits,
-                    parsed_header.height,
-                    &block_hash,
-                    VotePhase::Precommit,
-                )?;
-                let (staged, receipts) = execute_stage(
-                    &guard.exec,
-                    &guard.kzg,
-                    &parsed_header.epoch_seed,
-                    &block.init_swarms,
-                    &block.txs,
-                )?;
-                if compute_state_root(&staged) != parsed_header.state_root {
-                    return Err(Error::Network("commit state_root mismatch".into()));
+                match guard.apply_finalized_block(&block) {
+                    Ok(()) => P2pResponse::Ack { ok: true },
+                    Err(e) => P2pResponse::Error {
+                        message: e.to_string(),
+                    },
                 }
-                guard.exec = staged;
-                guard.bft.height = parsed_header.height;
-                guard.bft.last_block_hash = block_hash;
-                guard.bft.chain.push(FinalizedBlock {
-                    header: parsed_header,
-                    block_hash,
-                    receipts,
-                    precommits,
-                });
-                let epoch_seed = guard.epoch_seed;
-                let data_dir = guard.data_dir.clone();
-                ValidatorStorage::save_snapshot(&data_dir, &guard.bft, &guard.exec, &epoch_seed)?;
-                ValidatorStorage::append_block_wal(&data_dir, &block)?;
-                P2pResponse::Ack { ok: true }
             }
+        }
+        P2pRequest::SyncBlocks { from_height } => {
+            let guard = state.lock().await;
+            let blocks =
+                ValidatorStorage::read_blocks(&guard.data_dir, from_height, MAX_SYNC_BLOCKS)?;
+            P2pResponse::Blocks { blocks }
         }
         _ => P2pResponse::Error {
             message: "unsupported request on validator p2p".into(),
@@ -339,6 +433,20 @@ async fn handle_p2p_conn(
 
 async fn propose_and_finalize_distributed(
     state: Arc<Mutex<ValidatorRuntimeState>>,
+    init_swarms: Vec<InitSwarmRequest>,
+    txs: Vec<TxDto>,
+) -> Result<FinalizedBlockDto> {
+    match propose_once(&state, init_swarms.clone(), txs.clone()).await {
+        Err(Error::L1(l1_state_engine::Error::ConsensusFailed)) => {
+            sync_blocks(&state).await;
+            propose_once(&state, init_swarms, txs).await
+        }
+        result => result,
+    }
+}
+
+async fn propose_once(
+    state: &Arc<Mutex<ValidatorRuntimeState>>,
     init_swarms: Vec<InitSwarmRequest>,
     txs: Vec<TxDto>,
 ) -> Result<FinalizedBlockDto> {
@@ -423,21 +531,14 @@ async fn propose_and_finalize_distributed(
         guard
             .bft
             .verify_quorum(&precommits, expected_height, &block_hash, VotePhase::Precommit)?;
-        guard.exec = staged;
-        guard.bft.height = expected_height;
-        guard.bft.last_block_hash = block_hash;
         let finalized = FinalizedBlock {
             header,
             block_hash,
             receipts,
             precommits,
         };
-        guard.bft.chain.push(finalized.clone());
         let dto = FinalizedBlockDto::from_block(&finalized, init_swarms, txs);
-        let epoch_seed = guard.epoch_seed;
-        let data_dir = guard.data_dir.clone();
-        ValidatorStorage::save_snapshot(&data_dir, &guard.bft, &guard.exec, &epoch_seed)?;
-        ValidatorStorage::append_block_wal(&data_dir, &dto)?;
+        guard.commit_block(staged, finalized, &dto)?;
         dto
     };
 
@@ -588,4 +689,54 @@ async fn handle_rpc_conn(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wire::BlockHeaderDto;
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha8Rng;
+
+    fn stage_empty_block(prev_hash: [u8; 32]) -> Result<(Executor, FinalizedBlock)> {
+        let infos = (0..4u64)
+            .map(|id| ValidatorSigner::new(id, 1, deterministic_signing_key(900 + id)).info())
+            .collect();
+        let bft = BftEngine::new(infos)?;
+        let kzg = Kzg::setup(
+            MAX_SWARM_SIZE - 1,
+            &mut ChaCha8Rng::seed_from_u64(DEFAULT_KZG_SEED),
+        );
+        let header = BlockHeader {
+            height: 1,
+            prev_hash,
+            epoch_seed: DEFAULT_EPOCH_SEED,
+            proposer_id: 0,
+            tx_count: 0,
+            state_root: [0u8; 32],
+        };
+        let block = FinalizedBlockDto {
+            header: BlockHeaderDto::from(&header),
+            block_hash_hex: hex::encode(header.block_hash()),
+            init_swarms: Vec::new(),
+            txs: Vec::new(),
+            receipts: Vec::new(),
+            precommits: Vec::new(),
+        };
+        stage_finalized_block(
+            &Executor::new(ExecutorConfig::default()),
+            &bft,
+            &kzg,
+            &block,
+        )
+    }
+
+    #[test]
+    fn stage_rejects_prev_hash_mismatch_before_quorum_check() {
+        let err = stage_empty_block([7u8; 32]).err().expect("must reject");
+        assert!(err.to_string().contains("prev_hash mismatch"), "{err}");
+
+        let err = stage_empty_block([0u8; 32]).err().expect("quorum missing");
+        assert!(!err.to_string().contains("prev_hash"), "{err}");
+    }
 }
