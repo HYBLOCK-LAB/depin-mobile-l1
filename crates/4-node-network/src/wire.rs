@@ -21,6 +21,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 pub const MAX_SYNC_BLOCKS: usize = 64;
 const IO_TIMEOUT: Duration = Duration::from_secs(60);
 const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(60);
+const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 pub fn decode_fixed_hex<const N: usize>(s: &str) -> Result<[u8; N]> {
     let raw = hex::decode(s).map_err(|e| Error::Network(format!("invalid hex: {e}")))?;
@@ -941,11 +942,19 @@ where
     Fut: Future<Output = Result<()>> + Send + 'static,
 {
     tokio::spawn(async move {
-        while let Ok((stream, _)) = listener.accept().await {
-            let st = Arc::clone(&state);
-            tokio::spawn(async move {
-                let _ = handler(stream, st).await;
-            });
+        loop {
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    let st = Arc::clone(&state);
+                    tokio::spawn(async move {
+                        let _ = handler(stream, st).await;
+                    });
+                }
+                Err(e) => {
+                    eprintln!("tcp accept failed on {:?}: {e}", listener.local_addr());
+                    tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
+                }
+            }
         }
     })
 }
