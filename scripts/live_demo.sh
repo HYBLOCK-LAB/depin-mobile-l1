@@ -147,7 +147,7 @@ fi
 echo "Epoch $EPOCH_BEFORE -> $EPOCH_NOW settled by successor aggregator slot $AGG_NOW"
 grep -h EPOCH_SETTLED "$DEMO_DIR/logs/storage_6.log" | tail -3
 
-echo "[7/8] Restarting validator #0 from disk snapshot and verifying L1 state recovery..."
+echo "[7/8] Restarting validator #0 by replaying its block WAL and verifying L1 state recovery..."
 kill -9 "${VAL_PIDS[0]}" 2>/dev/null || true
 sleep 0.2
 "$NODE_BIN" validator \
