@@ -116,6 +116,7 @@ fn distributed_bft_lazy_repair_crash_recovery_and_download_e2e() {
                 ip_subnet_hash: *node_id as u16,
                 country_code: (*node_id % 8) as u8,
                 kzg_seed: DEFAULT_KZG_SEED,
+                auto_epoch_interval: None,
             })
             .await
             .expect("start storage node");
@@ -355,6 +356,7 @@ fn p2p_heartbeat_receipt_fault_proof_and_custodian_handoff_e2e() {
                 ip_subnet_hash: *node_id as u16,
                 country_code: (*node_id % 8) as u8,
                 kzg_seed: DEFAULT_KZG_SEED,
+                auto_epoch_interval: None,
             })
             .await
             .expect("start storage node");
@@ -562,6 +564,7 @@ fn p2p_heartbeat_receipt_fault_proof_and_custodian_handoff_e2e() {
             ip_subnet_hash: NODE_COUNT as u16,
             country_code: 2,
             kzg_seed: DEFAULT_KZG_SEED,
+            auto_epoch_interval: None,
         })
         .await
         .expect("start standby node");
@@ -691,6 +694,7 @@ fn auto_shuffle_zero_tx_routing_and_multifile_upload_download_e2e() {
                 ip_subnet_hash: *node_id as u16,
                 country_code: (*node_id % 8) as u8,
                 kzg_seed: DEFAULT_KZG_SEED,
+                auto_epoch_interval: None,
             })
             .await
             .expect("start storage node");
@@ -905,6 +909,7 @@ fn batch_registration_16_nodes_forms_adaptive_14_node_swarm_and_repairs_e2e() {
                 ip_subnet_hash: *node_id as u16,
                 country_code: (*node_id % 8) as u8,
                 kzg_seed: DEFAULT_KZG_SEED,
+                auto_epoch_interval: None,
             })
             .await
             .expect("start storage node");

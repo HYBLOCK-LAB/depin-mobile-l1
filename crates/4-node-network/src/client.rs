@@ -1,7 +1,9 @@
+use crate::persistence::NodeStorage;
 use crate::storage_daemon::sorted_slot_keys;
 use crate::wire::{
     decode_fixed_hex, http_request_json, send_p2p, FinalizedBlockDto, L1StatusDto, P2pRequest,
-    P2pResponse, ShardDto, SlotAssignmentDto, SwarmClusterMapDto, SwarmManifestDto, TxDto,
+    P2pResponse, ShardDto, SlotAssignmentDto, SwarmClusterMapDto, SwarmManifestDto,
+    SwarmSummaryDto, TxDto,
 };
 use crate::{Error, Result};
 use l1_state_engine::shuffler::route_file_to_swarm;
@@ -9,6 +11,7 @@ use l1_state_engine::state_db::{NativeTransaction, MAX_SWARM_SIZE, MIN_SWARM_SIZ
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
+use std::path::Path;
 use tokio::task::JoinSet;
 use verkle_fountain::fountain::{decode, encode, Shard};
 use verkle_fountain::verkle_kzg::{scalar_to_bytes, Kzg, KzgProof, Scalar};
@@ -412,4 +415,146 @@ pub async fn download_payload(
     let count = shards.len();
     let recovered = decode(&shards)?;
     Ok((recovered, count))
+}
+
+pub async fn submit_native_tx(
+    l1_rpc_url: &str,
+    tx: &NativeTransaction,
+) -> Result<FinalizedBlockDto> {
+    http_request_json(l1_rpc_url, "POST", "/tx/submit", Some(&TxDto::from_native(tx))).await
+}
+
+pub fn fault_proof_txs(
+    swarm: &SwarmSummaryDto,
+    node_slot: u8,
+    data_dir: &Path,
+) -> Result<Vec<(u64, NativeTransaction)>> {
+    let mut txs = Vec::new();
+    for settlement in &swarm.recent_settlements {
+        let bitmap: u128 = settlement
+            .uptime_bitmap
+            .parse()
+            .map_err(|_| Error::Network("invalid u128 uptime_bitmap".into()))?;
+        if bitmap & (1u128 << node_slot) != 0 {
+            continue;
+        }
+        if let Some((aggregator_slot, signed_pong_receipt)) =
+            NodeStorage::load_heartbeat_receipt(data_dir, settlement.epoch, node_slot)?
+        {
+            if aggregator_slot == settlement.aggregator_slot {
+                txs.push((
+                    settlement.epoch,
+                    NativeTransaction::SubmitHeartbeatFaultProof {
+                        swarm_id: swarm.swarm_id,
+                        epoch: settlement.epoch,
+                        node_slot,
+                        aggregator_slot,
+                        signed_pong_receipt,
+                    },
+                ));
+            }
+        }
+    }
+    Ok(txs)
+}
+
+pub async fn request_handoff(
+    l1_rpc_url: &str,
+    object_id_hex: &str,
+    slot: u8,
+) -> Result<P2pResponse> {
+    let status = fetch_l1_status(l1_rpc_url).await?;
+    let rpc_urls: BTreeSet<String> = endpoint_index(&status, None)
+        .into_values()
+        .map(|(_, rpc)| format!("http://{rpc}"))
+        .collect();
+    let manifest = fetch_live_manifest(&rpc_urls, object_id_hex, None)
+        .await
+        .ok_or_else(|| Error::Network(format!("manifest for object {object_id_hex} not found")))?;
+    let custodian_slot = *manifest.custodian_owners.get(&slot).ok_or_else(|| {
+        Error::Network(format!("slot {slot} has no custodian for object {object_id_hex}"))
+    })?;
+    let swarm = status
+        .swarms
+        .iter()
+        .find(|s| s.swarm_id == manifest.swarm_id)
+        .ok_or_else(|| Error::Network(format!("swarm {} not found on L1", manifest.swarm_id)))?;
+    let roster = resolve_roster(&status, &swarm.roster_pubkeys_hex, None)?;
+    let member = |slot: u8| {
+        roster
+            .get(slot as usize)
+            .ok_or_else(|| Error::Network(format!("slot {slot} is outside the L1 roster")))
+    };
+    send_p2p(
+        member(custodian_slot)?.p2p_addr,
+        &P2pRequest::HandoffShard {
+            slot,
+            object_id_hex: object_id_hex.to_string(),
+            target_p2p_addr: member(slot)?.p2p_addr.to_string(),
+        },
+    )
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wire::SettlementDto;
+    use l1_state_engine::state_db::VirtualSwarmState;
+
+    fn swarm(settlements: Vec<(u64, u8, u128)>) -> SwarmSummaryDto {
+        SwarmSummaryDto {
+            swarm_id: 0,
+            state: VirtualSwarmState {
+                swarm_id: 0,
+                member_verkle_root: [0; 48],
+                active_blobs_root: [0; 48],
+                total_bond_balance: 0,
+                storage_bounty_pool: 0,
+                last_epoch_settled: 0,
+                swarm_size_n: 0,
+                min_threshold_k: 0,
+                lazy_repair_trigger: 0,
+                lazy_repair_target: 0,
+            },
+            roster_pubkeys_hex: Vec::new(),
+            recent_settlements: settlements
+                .into_iter()
+                .map(|(epoch, aggregator_slot, bitmap)| SettlementDto {
+                    epoch,
+                    aggregator_slot,
+                    uptime_bitmap: bitmap.to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn fault_proof_txs_select_only_zero_bit_settlements_with_matching_receipt() {
+        let dir = std::env::temp_dir().join(format!("depin_fault_proof_txs_{}", std::process::id()));
+        let sig_hex = "11".repeat(64);
+        NodeStorage::save_heartbeat_receipt(&dir, 0, 1, 2, 0, &sig_hex).unwrap();
+        NodeStorage::save_heartbeat_receipt(&dir, 0, 2, 2, 0, &sig_hex).unwrap();
+        NodeStorage::save_heartbeat_receipt(&dir, 0, 3, 2, 5, &sig_hex).unwrap();
+
+        let txs = fault_proof_txs(
+            &swarm(vec![(1, 0, 0b011), (2, 0, 0b111), (3, 0, 0b011), (4, 0, 0b011)]),
+            2,
+            &dir,
+        )
+        .unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(txs.len(), 1);
+        assert_eq!(txs[0].0, 1);
+        assert!(matches!(
+            txs[0].1,
+            NativeTransaction::SubmitHeartbeatFaultProof {
+                epoch: 1,
+                node_slot: 2,
+                aggregator_slot: 0,
+                ..
+            }
+        ));
+    }
 }

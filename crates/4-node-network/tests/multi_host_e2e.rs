@@ -108,6 +108,7 @@ fn auto_register_nodes_without_cluster_map_upload_and_download_via_l1_only_e2e()
                 ip_subnet_hash: node_id as u16,
                 country_code: (node_id % 8) as u8,
                 kzg_seed: DEFAULT_KZG_SEED,
+                auto_epoch_interval: None,
             };
             nodes.push(
                 start_storage_daemon(config.clone())
@@ -205,6 +206,7 @@ fn auto_register_rejects_unspecified_public_endpoint() {
             ip_subnet_hash: 0,
             country_code: 0,
             kzg_seed: DEFAULT_KZG_SEED,
+            auto_epoch_interval: None,
         })
         .await;
         assert!(result.is_err());

@@ -551,10 +551,19 @@ pub struct InitSwarmRequest {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SettlementDto {
+    pub epoch: u64,
+    pub aggregator_slot: u8,
+    pub uptime_bitmap: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SwarmSummaryDto {
     pub swarm_id: u64,
     pub state: VirtualSwarmState,
     pub roster_pubkeys_hex: Vec<String>,
+    #[serde(default)]
+    pub recent_settlements: Vec<SettlementDto>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

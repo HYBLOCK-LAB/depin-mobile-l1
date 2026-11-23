@@ -1,10 +1,11 @@
 use clap::{Parser, Subcommand};
 use l1_state_engine::state_db::MAX_SWARM_SIZE;
 use node_network::client::{
-    build_cluster_map, download_payload, register_cluster_batch_via_nodes, upload_payload,
+    build_cluster_map, download_payload, fault_proof_txs, fetch_l1_status, locate_node,
+    register_cluster_batch_via_nodes, request_handoff, submit_native_tx, upload_payload,
 };
 use node_network::l1_daemon::DEFAULT_KZG_SEED;
-use node_network::persistence::ValidatorStorage;
+use node_network::persistence::{load_node_pubkeys_hex, ValidatorStorage};
 use node_network::wire::{
     http_request_json, CycleReportDto, FinalizedBlockDto, L1StatusDto, SwarmClusterMapDto,
 };
@@ -70,6 +71,22 @@ enum Command {
         #[arg(long)]
         node_rpc: String,
         #[arg(long, default_value_t = 1)]
+        epoch: u64,
+    },
+    HandoffShard {
+        #[arg(long)]
+        l1_rpc: String,
+        #[arg(long)]
+        object_id: String,
+        #[arg(long)]
+        slot: u8,
+    },
+    SubmitFaultProof {
+        #[arg(long)]
+        l1_rpc: String,
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
         epoch: u64,
     },
     Download {
@@ -219,6 +236,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .await?;
                 println!("{}", serde_json::to_string_pretty(&report)?);
+            }
+            Command::HandoffShard {
+                l1_rpc,
+                object_id,
+                slot,
+            } => {
+                let reply = request_handoff(&l1_rpc, &object_id, slot).await?;
+                println!("{}", serde_json::to_string_pretty(&reply)?);
+            }
+            Command::SubmitFaultProof {
+                l1_rpc,
+                data_dir,
+                epoch,
+            } => {
+                let status = fetch_l1_status(&l1_rpc).await?;
+                let mut submitted = 0usize;
+                for pubkey in load_node_pubkeys_hex(&data_dir)? {
+                    let Some((swarm_id, slot)) = locate_node(&status, &pubkey) else {
+                        continue;
+                    };
+                    let swarm = status
+                        .swarms
+                        .iter()
+                        .find(|s| s.swarm_id == swarm_id)
+                        .ok_or("swarm missing on L1")?;
+                    for (_, tx) in fault_proof_txs(swarm, slot, &data_dir)?
+                        .into_iter()
+                        .filter(|(proof_epoch, _)| *proof_epoch == epoch)
+                    {
+                        let block = submit_native_tx(&l1_rpc, &tx).await?;
+                        println!(
+                            "FAULT_PROOF_SUBMITTED swarm={swarm_id} epoch={epoch} slot={slot} height={}",
+                            block.header.height
+                        );
+                        submitted += 1;
+                    }
+                }
+                if submitted == 0 {
+                    return Err(format!(
+                        "no disputable settlement with a local heartbeat receipt for epoch {epoch}"
+                    )
+                    .into());
+                }
             }
             Command::Download {
                 l1_rpc,

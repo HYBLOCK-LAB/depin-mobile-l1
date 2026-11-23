@@ -76,6 +76,19 @@ pub fn load_or_create_random_signing_key(path: &Path) -> Result<SigningKey> {
     Ok(key)
 }
 
+pub const KEYS_DIR: &str = "keys";
+
+pub fn load_node_pubkeys_hex(data_dir: &Path) -> Result<Vec<String>> {
+    let mut pubkeys = Vec::new();
+    for entry in fs::read_dir(data_dir.join(KEYS_DIR))? {
+        let path = entry?.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("hex") {
+            pubkeys.push(hex::encode(compressed_pubkey(&load_signing_key(&path)?)));
+        }
+    }
+    Ok(pubkeys)
+}
+
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -140,6 +153,7 @@ impl ValidatorStorage {
                     swarm_id: *swarm_id,
                     state: state.clone(),
                     roster_pubkeys_hex: roster,
+                    recent_settlements: Vec::new(),
                 }
             })
             .collect();

@@ -3,6 +3,9 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEMO_DIR="/tmp/depin-live-demo"
+AUTO_EPOCH_SECS=2
+EPOCH_WAIT_POLLS=120
+L1_STATUS_URL="http://127.0.0.1:19110/status"
 PIDS=()
 
 cleanup() {
@@ -74,7 +77,7 @@ for id in 0 1 2 3; do
   wait_health "http://127.0.0.1:$((19110 + id))"
 done
 
-echo "[3/8] Launching 10 storage node processes (10 swarm slots, 1 slot per node) & registering on L1..."
+echo "[3/8] Launching 10 storage node processes (1 slot per node, autonomous epoch loop every ${AUTO_EPOCH_SECS}s) & registering on L1..."
 NODE_PIDS=()
 for nid in $(seq 0 9); do
   "$NODE_BIN" storage \
@@ -86,6 +89,7 @@ for nid in $(seq 0 9); do
     --data-dir "$DEMO_DIR/storage_$nid" \
     --ip-subnet-hash "$nid" \
     --country-code "$((nid % 8))" \
+    --auto-epoch-secs "$AUTO_EPOCH_SECS" \
     >"$DEMO_DIR/logs/storage_$nid.log" 2>&1 &
   pid=$!
   PIDS+=("$pid")
@@ -117,8 +121,26 @@ for nid in 0 1 2 3 4 5; do
 done
 sleep 0.2
 
-echo "[6/8] Triggering epoch 1 aggregator cycle on surviving successor Node #6 (slot 6)..."
-"$CLI_BIN" run-cycle --node-rpc "http://127.0.0.1:19306" --epoch 1
+l1_status_field() {
+  curl -fsS "$L1_STATUS_URL" | grep -o "\"$1\":[0-9]*" | "$2" -1 | cut -d: -f2
+}
+
+echo "[6/8] Waiting for the surviving successor (slot 6) to take over as aggregator and settle a new epoch autonomously..."
+EPOCH_BEFORE="$(l1_status_field last_epoch_settled head)"
+for _ in $(seq 1 "$EPOCH_WAIT_POLLS"); do
+  EPOCH_NOW="$(l1_status_field last_epoch_settled head || echo "$EPOCH_BEFORE")"
+  AGG_NOW="$(l1_status_field aggregator_slot tail || echo "")"
+  if [ "$EPOCH_NOW" -gt "$EPOCH_BEFORE" ] && [ "$AGG_NOW" = "6" ]; then
+    break
+  fi
+  sleep 0.5
+done
+if [ "$AGG_NOW" != "6" ] || [ "$EPOCH_NOW" -le "$EPOCH_BEFORE" ]; then
+  echo "Successor aggregator did not settle a new epoch (epoch $EPOCH_BEFORE -> $EPOCH_NOW, aggregator slot '$AGG_NOW')" >&2
+  exit 1
+fi
+echo "Epoch $EPOCH_BEFORE -> $EPOCH_NOW settled by successor aggregator slot $AGG_NOW"
+grep -h EPOCH_SETTLED "$DEMO_DIR/logs/storage_6.log" | tail -3
 
 echo "[7/8] Restarting validator #0 from disk snapshot and verifying L1 state recovery..."
 kill -9 "${VAL_PIDS[0]}" 2>/dev/null || true
