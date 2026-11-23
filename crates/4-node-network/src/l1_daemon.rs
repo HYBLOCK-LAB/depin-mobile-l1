@@ -299,6 +299,7 @@ pub async fn start_validator_daemon(
         data_dir: config.data_dir,
         peer_p2p_addrs: config.peer_p2p_addrs,
     };
+    ValidatorStorage::truncate_corrupt_wal_tail(&runtime.data_dir)?;
     for block in ValidatorStorage::read_blocks(&runtime.data_dir, 0, usize::MAX)? {
         let (staged, finalized) =
             stage_finalized_block(&runtime.exec, &runtime.bft, &runtime.kzg, &block)?;

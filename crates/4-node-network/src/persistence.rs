@@ -95,6 +95,26 @@ impl ValidatorStorage {
         Ok(())
     }
 
+    pub fn truncate_corrupt_wal_tail(data_dir: &Path) -> Result<()> {
+        let path = data_dir.join("blocks.jsonl");
+        if !path.exists() {
+            return Ok(());
+        }
+        let content = fs::read(&path)?;
+        let body = content.strip_suffix(b"\n").unwrap_or(&content);
+        let start = body.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+        let tail = &body[start..];
+        if tail.is_empty() || serde_json::from_slice::<FinalizedBlockDto>(tail).is_ok() {
+            return Ok(());
+        }
+        eprintln!("blocks.jsonl: truncating corrupt last line at byte {start}");
+        OpenOptions::new()
+            .write(true)
+            .open(path)?
+            .set_len(start as u64)?;
+        Ok(())
+    }
+
     pub fn read_blocks(
         data_dir: &Path,
         from_height: u64,
@@ -508,6 +528,59 @@ mod tests {
             1
         );
         assert!(exec.db.nodes.contains_key(&pk));
+    }
+
+    fn sample_block_line() -> String {
+        let signers: Vec<ValidatorSigner> = (0..4)
+            .map(|id| ValidatorSigner::new(id, 1, deterministic_signing_key(900 + id)))
+            .collect();
+        let infos: Vec<ValidatorInfo> = signers.iter().map(|s| s.info()).collect();
+        let mut bft = BftEngine::new(infos).unwrap();
+        let mut exec = Executor::new(ExecutorConfig::default());
+        let kzg = Kzg::setup(7, &mut ChaCha8Rng::seed_from_u64(55));
+        let block = bft
+            .propose_and_finalize(
+                &mut exec,
+                &kzg,
+                0,
+                vec![],
+                [0x5Au8; 32],
+                &[&signers[0], &signers[1], &signers[2]],
+            )
+            .unwrap();
+        serde_json::to_string(&FinalizedBlockDto::from_block(&block, vec![], vec![])).unwrap()
+    }
+
+    #[test]
+    fn truncate_corrupt_wal_tail_drops_only_last_partial_line() {
+        let dir = TempDir::new("walrepair");
+        let line = sample_block_line();
+        let wal = dir.path.join("blocks.jsonl");
+        fs::write(&wal, format!("{line}\n{}", &line[..line.len() / 2])).unwrap();
+
+        ValidatorStorage::truncate_corrupt_wal_tail(&dir.path).unwrap();
+
+        assert_eq!(fs::read_to_string(&wal).unwrap(), format!("{line}\n"));
+        assert_eq!(
+            ValidatorStorage::read_blocks(&dir.path, 0, usize::MAX)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn corrupt_middle_wal_line_still_fails() {
+        let dir = TempDir::new("walmiddle");
+        let line = sample_block_line();
+        let wal = dir.path.join("blocks.jsonl");
+        let content = format!("{}\n{line}\n", &line[..line.len() / 2]);
+        fs::write(&wal, &content).unwrap();
+
+        ValidatorStorage::truncate_corrupt_wal_tail(&dir.path).unwrap();
+
+        assert_eq!(fs::read_to_string(&wal).unwrap(), content);
+        assert!(ValidatorStorage::read_blocks(&dir.path, 0, usize::MAX).is_err());
     }
 
     #[test]
