@@ -18,6 +18,7 @@ use l1_state_engine::state_db::{
 };
 use p256::ecdsa::SigningKey;
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -48,6 +49,7 @@ struct ValidatorRuntimeState {
     epoch_seed: [u8; 32],
     data_dir: PathBuf,
     peer_p2p_addrs: Vec<SocketAddr>,
+    voted_blocks: BTreeMap<u64, [u8; 32]>,
 }
 
 impl ValidatorRuntimeState {
@@ -55,6 +57,8 @@ impl ValidatorRuntimeState {
         self.exec = staged;
         self.bft.height = finalized.header.height;
         self.bft.last_block_hash = finalized.block_hash;
+        self.voted_blocks
+            .insert(finalized.header.height, finalized.block_hash);
         self.bft.chain.push(finalized);
     }
 
@@ -187,6 +191,9 @@ fn stage_finalized_block(
     block: &FinalizedBlockDto,
 ) -> Result<(Executor, FinalizedBlock)> {
     let header = BlockHeader::try_from(&block.header)?;
+    if !bft.validators.iter().any(|v| v.id == header.proposer_id) {
+        return Err(Error::L1(l1_state_engine::Error::Unauthorized));
+    }
     if header.height != bft.height + 1 {
         return Err(Error::Network(format!(
             "unexpected block height {}, current {}",
@@ -299,6 +306,7 @@ pub async fn start_validator_daemon(
         epoch_seed: config.epoch_seed,
         data_dir: config.data_dir,
         peer_p2p_addrs: config.peer_p2p_addrs,
+        voted_blocks: BTreeMap::new(),
     };
     ValidatorStorage::truncate_corrupt_wal_tail(&runtime.data_dir)?;
     for block in ValidatorStorage::read_blocks(&runtime.data_dir, 0, usize::MAX)? {
@@ -340,12 +348,27 @@ async fn handle_p2p_conn(
             txs,
         } => {
             sync_if_behind(&state, header.height).await;
-            let guard = state.lock().await;
+            let mut guard = state.lock().await;
             let expected_height = guard.bft.height + 1;
             let parsed_header = BlockHeader::try_from(&header)?;
             let proposed_hash = decode_fixed_hex::<32>(&block_hash_hex)?;
 
-            if parsed_header.height != expected_height
+            if !guard
+                .bft
+                .validators
+                .iter()
+                .any(|v| v.id == parsed_header.proposer_id)
+            {
+                P2pResponse::BftVoteReply {
+                    accepted: false,
+                    prevote: None,
+                    precommit: None,
+                    reason: Some(format!(
+                        "unregistered proposer {}",
+                        parsed_header.proposer_id
+                    )),
+                }
+            } else if parsed_header.height != expected_height
                 || parsed_header.prev_hash != guard.bft.last_block_hash
                 || parsed_header.block_hash() != proposed_hash
             {
@@ -355,6 +378,20 @@ async fn handle_p2p_conn(
                     precommit: None,
                     reason: Some(format!(
                         "header mismatch: expected height {expected_height}, got {}",
+                        parsed_header.height
+                    )),
+                }
+            } else if guard
+                .voted_blocks
+                .get(&parsed_header.height)
+                .is_some_and(|voted| *voted != proposed_hash)
+            {
+                P2pResponse::BftVoteReply {
+                    accepted: false,
+                    prevote: None,
+                    precommit: None,
+                    reason: Some(format!(
+                        "already voted for a different block at height {}",
                         parsed_header.height
                     )),
                 }
@@ -376,6 +413,9 @@ async fn handle_p2p_conn(
                                 reason: Some("state_root mismatch".into()),
                             }
                         } else {
+                            guard
+                                .voted_blocks
+                                .insert(parsed_header.height, proposed_hash);
                             let pv = guard.signer.sign_vote(
                                 parsed_header.height,
                                 proposed_hash,
@@ -460,7 +500,7 @@ async fn propose_once(
         staged,
         receipts,
     ) = {
-        let guard = state.lock().await;
+        let mut guard = state.lock().await;
         let (staged, receipts) = execute_stage(
             &guard.exec,
             &guard.kzg,
@@ -478,6 +518,14 @@ async fn propose_once(
             state_root: compute_state_root(&staged),
         };
         let block_hash = header.block_hash();
+        if guard
+            .voted_blocks
+            .get(&next_height)
+            .is_some_and(|voted| *voted != block_hash)
+        {
+            return Err(Error::L1(l1_state_engine::Error::ConsensusFailed));
+        }
+        guard.voted_blocks.insert(next_height, block_hash);
         let pv = guard
             .signer
             .sign_vote(next_height, block_hash, VotePhase::Prevote);
@@ -746,5 +794,146 @@ mod tests {
 
         let err = stage_empty_block([0u8; 32]).err().expect("quorum missing");
         assert!(!err.to_string().contains("prev_hash"), "{err}");
+    }
+
+    #[test]
+    fn stage_rejects_unregistered_proposer() {
+        let infos = (0..4u64)
+            .map(|id| ValidatorSigner::new(id, 1, deterministic_signing_key(900 + id)).info())
+            .collect();
+        let bft = BftEngine::new(infos).expect("bft");
+        let kzg = Kzg::setup(
+            MAX_SWARM_SIZE - 1,
+            &mut ChaCha8Rng::seed_from_u64(DEFAULT_KZG_SEED),
+        );
+        let header = BlockHeader {
+            height: 1,
+            prev_hash: [0u8; 32],
+            epoch_seed: DEFAULT_EPOCH_SEED,
+            proposer_id: 99,
+            tx_count: 0,
+            state_root: [0u8; 32],
+        };
+        let block = FinalizedBlockDto {
+            header: BlockHeaderDto::from(&header),
+            block_hash_hex: hex::encode(header.block_hash()),
+            init_swarms: Vec::new(),
+            txs: Vec::new(),
+            receipts: Vec::new(),
+            precommits: Vec::new(),
+        };
+        let err = stage_finalized_block(&Executor::new(ExecutorConfig::default()), &bft, &kzg, &block)
+            .err()
+            .expect("must reject unregistered proposer");
+        assert!(matches!(err, Error::L1(l1_state_engine::Error::Unauthorized)));
+    }
+
+    #[test]
+    fn bft_propose_rejects_equivocating_block_and_unregistered_proposer() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(async {
+        let dir = std::env::temp_dir().join(format!("depin_bft_equiv_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let daemon = start_validator_daemon(ValidatorDaemonConfig {
+            validator_id: 0,
+            p2p_addr: "127.0.0.1:0".parse().expect("addr"),
+            rpc_addr: "127.0.0.1:0".parse().expect("addr"),
+            peer_p2p_addrs: Vec::new(),
+            validator_seeds: (0..4u64).map(|id| (id, 900 + id)).collect(),
+            data_dir: dir.clone(),
+            epoch_seed: DEFAULT_EPOCH_SEED,
+            kzg_seed: DEFAULT_KZG_SEED,
+        })
+        .await
+        .expect("start validator");
+
+        let exec = Executor::new(ExecutorConfig::default());
+        let valid_root = compute_state_root(&exec);
+        let h1 = BlockHeader {
+            height: 1,
+            prev_hash: [0u8; 32],
+            epoch_seed: DEFAULT_EPOCH_SEED,
+            proposer_id: 1,
+            tx_count: 0,
+            state_root: valid_root,
+        };
+        let first_reply = send_p2p(
+            daemon.p2p_addr,
+            &P2pRequest::BftPropose {
+                header: BlockHeaderDto::from(&h1),
+                block_hash_hex: hex::encode(h1.block_hash()),
+                init_swarms: Vec::new(),
+                txs: Vec::new(),
+            },
+        )
+        .await
+        .expect("first propose");
+        assert!(matches!(
+            first_reply,
+            P2pResponse::BftVoteReply { accepted: true, .. }
+        ));
+
+        let conflicting = BlockHeader {
+            height: 1,
+            prev_hash: [0u8; 32],
+            epoch_seed: [0x11; 32],
+            proposer_id: 2,
+            tx_count: 0,
+            state_root: valid_root,
+        };
+        let equiv_reply = send_p2p(
+            daemon.p2p_addr,
+            &P2pRequest::BftPropose {
+                header: BlockHeaderDto::from(&conflicting),
+                block_hash_hex: hex::encode(conflicting.block_hash()),
+                init_swarms: Vec::new(),
+                txs: Vec::new(),
+            },
+        )
+        .await
+        .expect("conflicting propose");
+        assert!(matches!(
+            equiv_reply,
+            P2pResponse::BftVoteReply {
+                accepted: false,
+                reason: Some(ref msg),
+                ..
+            } if msg.contains("already voted")
+        ));
+
+        let bad_proposer = BlockHeader {
+            height: 1,
+            prev_hash: [0u8; 32],
+            epoch_seed: DEFAULT_EPOCH_SEED,
+            proposer_id: 99,
+            tx_count: 0,
+            state_root: valid_root,
+        };
+        let unreg_reply = send_p2p(
+            daemon.p2p_addr,
+            &P2pRequest::BftPropose {
+                header: BlockHeaderDto::from(&bad_proposer),
+                block_hash_hex: hex::encode(bad_proposer.block_hash()),
+                init_swarms: Vec::new(),
+                txs: Vec::new(),
+            },
+        )
+        .await
+        .expect("unregistered proposer");
+        assert!(matches!(
+            unreg_reply,
+            P2pResponse::BftVoteReply {
+                accepted: false,
+                reason: Some(ref msg),
+                ..
+            } if msg.contains("unregistered proposer")
+        ));
+
+        daemon.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 }

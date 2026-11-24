@@ -22,7 +22,10 @@ use l1_state_engine::shuffler::score_node;
 use l1_state_engine::state_db::{
     object_weight, NativeTransaction, RepairAuditProof, RepairEntry, MAX_SWARM_SIZE,
 };
-use p256::ecdsa::{signature::Signer, Signature, SigningKey};
+use p256::ecdsa::{
+    signature::{Signer, Verifier},
+    Signature, SigningKey, VerifyingKey,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
@@ -588,7 +591,31 @@ async fn handle_storage_rpc(mut stream: TcpStream, state: Arc<StorageRuntimeStat
     Ok(())
 }
 
+fn verify_pong_signature(
+    swarm_id: u64,
+    epoch: u64,
+    slot: u8,
+    pubkey_hex: &str,
+    sig_hex: &str,
+) -> bool {
+    let Ok(pk) = decode_fixed_hex::<33>(pubkey_hex) else {
+        return false;
+    };
+    let Ok(sig_bytes) = decode_fixed_hex::<64>(sig_hex) else {
+        return false;
+    };
+    let Ok(vk) = VerifyingKey::from_sec1_bytes(&pk) else {
+        return false;
+    };
+    let Ok(sig) = Signature::from_slice(&sig_bytes) else {
+        return false;
+    };
+    let msg = heartbeat_signing_bytes(swarm_id, epoch, slot);
+    vk.verify(&msg, &sig).is_ok()
+}
+
 async fn ping_all_slots(
+    swarm_id: u64,
     roster: &[RosterMember],
     from_slot: u8,
     epoch: u64,
@@ -597,6 +624,7 @@ async fn ping_all_slots(
     for member in roster {
         let l1_slot = member.slot;
         let addr = member.p2p_addr;
+        let pubkey_hex = member.pubkey_hex.clone();
         set.spawn(async move {
             let ok = matches!(
                 send_p2p(
@@ -610,7 +638,13 @@ async fn ping_all_slots(
                     }
                 )
                 .await,
-                Ok(P2pResponse::Pong { slot: reply_slot, .. }) if reply_slot == l1_slot
+                Ok(P2pResponse::Pong {
+                    slot: reply_slot,
+                    epoch: reply_epoch,
+                    sig_hex,
+                }) if reply_slot == l1_slot
+                    && reply_epoch == epoch
+                    && verify_pong_signature(swarm_id, epoch, l1_slot, &pubkey_hex, &sig_hex)
             );
             (l1_slot, ok)
         });
@@ -624,12 +658,11 @@ async fn ping_all_slots(
     Ok(online)
 }
 
-async fn fetch_accessible_shards(
+fn accessible_slot_targets(
     slots: &[RosterMember],
     online_slots: &BTreeSet<u8>,
     custodian_owners: &BTreeMap<u8, u8>,
-    object_id_hex: &str,
-) -> Result<Vec<(usize, Shard)>> {
+) -> Vec<(u8, SocketAddr)> {
     let mut targets: Vec<(u8, SocketAddr)> = Vec::new();
     for slot in 0..slots.len() as u8 {
         let holder_slot = if online_slots.contains(&slot) {
@@ -645,6 +678,16 @@ async fn fetch_accessible_shards(
             }
         }
     }
+    targets
+}
+
+async fn fetch_accessible_shards(
+    slots: &[RosterMember],
+    online_slots: &BTreeSet<u8>,
+    custodian_owners: &BTreeMap<u8, u8>,
+    object_id_hex: &str,
+) -> Result<Vec<(usize, Shard)>> {
+    let targets = accessible_slot_targets(slots, online_slots, custodian_owners);
 
     let obj = object_id_hex.to_string();
     let mut set = JoinSet::new();
@@ -931,7 +974,10 @@ async fn run_epoch_if_aggregator(
     .into_iter()
     .filter(|member| member.slot < local_slot)
     .collect();
-    if !ping_all_slots(&lower_slots, local_slot, epoch).await?.is_empty() {
+    if !ping_all_slots(swarm_id, &lower_slots, local_slot, epoch)
+        .await?
+        .is_empty()
+    {
         return Ok(());
     }
     let report = execute_aggregator_cycle(state, epoch).await?;
@@ -1013,7 +1059,7 @@ async fn execute_aggregator_cycle(
         state.cluster_map.as_ref(),
     )?;
 
-    let online_slots = ping_all_slots(&roster, local_slot, epoch).await?;
+    let online_slots = ping_all_slots(swarm_id, &roster, local_slot, epoch).await?;
     let aggregator_slot = *online_slots
         .iter()
         .next()
@@ -1061,52 +1107,68 @@ async fn execute_aggregator_cycle(
     }
     let old_proofs = state.kzg.open_all(&old_fps)?;
 
-    for object in objects.iter_mut() {
-        object.shards = fetch_accessible_shards(
-            &roster,
-            &online_slots,
-            &object.manifest.custodian_owners,
-            &object.manifest.object_id_hex,
-        )
-        .await?
-        .into_iter()
-        .collect();
-    }
-    let mut common: BTreeSet<usize> = objects[0].shards.keys().copied().collect();
+    let object_accessible_slots = |custodians: &BTreeMap<u8, u8>| -> BTreeSet<usize> {
+        accessible_slot_targets(&roster, &online_slots, custodians)
+            .into_iter()
+            .map(|(slot, _)| slot as usize)
+            .collect()
+    };
+    let mut common = object_accessible_slots(&objects[0].manifest.custodian_owners);
     for object in &objects[1..] {
-        common.retain(|slot| object.shards.contains_key(slot));
-    }
-    for object in objects.iter_mut() {
-        object.shards.retain(|slot, _| common.contains(slot));
+        let obj_slots = object_accessible_slots(&object.manifest.custodian_owners);
+        common.retain(|slot| obj_slots.contains(slot));
     }
     let accessible_before = common.len();
-    let k = objects[0]
-        .shards
-        .values()
-        .next()
-        .map(|s| s.k)
-        .ok_or_else(|| Error::Network("no accessible shards found".into()))?;
-    for object in &objects {
-        let rows: Vec<Vec<Scalar>> = object
-            .shards
-            .values()
-            .map(|s| s.coefficients.clone())
-            .collect();
-        if rank(&rows, k) < k {
-            return Err(Error::Network("insufficient linear rank across live shards".into()));
-        }
+    if accessible_before == 0 {
+        return Err(Error::Network("no accessible shards found".into()));
     }
 
     let mut repair_log: Vec<RepairEntry> = Vec::new();
     let online_vec: Vec<u8> = online_slots.iter().copied().collect();
 
+    // 안전버퍼(> trigger) 구간에서는 불필요한 FetchShard 전송을 수행하지 않고 0-트래픽 정산한다.
     if accessible_before <= trigger {
+        for object in objects.iter_mut() {
+            object.shards = fetch_accessible_shards(
+                &roster,
+                &online_slots,
+                &object.manifest.custodian_owners,
+                &object.manifest.object_id_hex,
+            )
+            .await?
+            .into_iter()
+            .collect();
+        }
+        common = objects[0].shards.keys().copied().collect();
+        for object in &objects[1..] {
+            common.retain(|slot| object.shards.contains_key(slot));
+        }
+        for object in objects.iter_mut() {
+            object.shards.retain(|slot, _| common.contains(slot));
+        }
+        let k = objects[0]
+            .shards
+            .values()
+            .next()
+            .map(|s| s.k)
+            .ok_or_else(|| Error::Network("no accessible shards found".into()))?;
+        for object in &objects {
+            let rows: Vec<Vec<Scalar>> = object
+                .shards
+                .values()
+                .map(|s| s.coefficients.clone())
+                .collect();
+            if rank(&rows, k) < k {
+                return Err(Error::Network("insufficient linear rank across live shards".into()));
+            }
+        }
+
         let target_slots: Vec<u8> = (0..n)
             .filter(|i| !common.contains(i))
             .map(|i| i as u8)
             .collect();
         let needed = target
-            .saturating_sub(accessible_before)
+            .saturating_sub(common.len())
             .min(target_slots.len());
         let parents: Vec<usize> = common.iter().copied().collect();
         let m = parents.len();
@@ -1382,5 +1444,49 @@ mod tests {
         let mut m = manifest(&[], &[(1, 2)]);
         sync_manifest_roster(&mut m, &roster(&["a2", "b2"]));
         assert_eq!(m.roster_pubkeys_hex, roster(&["a2", "b2"]));
+    }
+
+    #[test]
+    fn verify_pong_signature_accepts_valid_and_rejects_forged_replies() {
+        let sk = deterministic_signing_key(777);
+        let pk_hex = hex::encode(compressed_pubkey(&sk));
+        let msg = heartbeat_signing_bytes(0, 3, 5);
+        let sig: Signature = sk.sign(&msg);
+        let sig_hex = hex::encode(sig.to_bytes());
+
+        assert!(verify_pong_signature(0, 3, 5, &pk_hex, &sig_hex));
+        assert!(!verify_pong_signature(0, 3, 6, &pk_hex, &sig_hex));
+        assert!(!verify_pong_signature(0, 4, 5, &pk_hex, &sig_hex));
+
+        let other_pk_hex = hex::encode(compressed_pubkey(&deterministic_signing_key(778)));
+        assert!(!verify_pong_signature(0, 3, 5, &other_pk_hex, &sig_hex));
+        assert!(!verify_pong_signature(0, 3, 5, &pk_hex, "bad_hex"));
+    }
+
+    #[test]
+    fn accessible_slot_targets_counts_online_owners_and_online_custodians() {
+        let roster: Vec<RosterMember> = (0..4u8)
+            .map(|slot| RosterMember {
+                slot,
+                pubkey_hex: format!("{slot:066x}"),
+                p2p_addr: format!("127.0.0.1:{}", 19000 + u16::from(slot))
+                    .parse()
+                    .expect("addr"),
+                rpc_addr: format!("127.0.0.1:{}", 19100 + u16::from(slot))
+                    .parse()
+                    .expect("addr"),
+            })
+            .collect();
+        let online = BTreeSet::from([2u8, 3u8]);
+        let custodians = BTreeMap::from([(0u8, 2u8), (1u8, 0u8)]);
+        let targets = accessible_slot_targets(&roster, &online, &custodians);
+        assert_eq!(
+            targets,
+            vec![
+                (0u8, roster[2].p2p_addr),
+                (2u8, roster[2].p2p_addr),
+                (3u8, roster[3].p2p_addr),
+            ]
+        );
     }
 }

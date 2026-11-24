@@ -30,6 +30,10 @@ pub fn verify_homomorphic_repair(
         || auth_a.shard.object_id != candidate.object_id
         || auth_a.shard.k != auth_b.shard.k
         || auth_a.shard.k != candidate.k
+        || auth_a.shard.original_len != auth_b.shard.original_len
+        || auth_a.shard.original_len != candidate.original_len
+        || auth_a.shard.symbols.len() != auth_b.shard.symbols.len()
+        || auth_a.shard.symbols.len() != candidate.symbols.len()
     {
         return Err(Error::InvalidInput);
     }
@@ -60,6 +64,18 @@ pub fn verify_homomorphic_repair(
         .zip(&candidate.coefficients)
         .all(|((ca, cb), cc)| *cc == *ca + factor_b * *cb);
     if !coeffs_match {
+        return Err(Error::PollutionDetected);
+    }
+
+    // 4. 심볼 벡터 전체의 F_p 선형 결합 정합성 대조 (공개 평가점 r에 대한 다항식 지문 충돌 공격 F01 차단)
+    let symbols_match = auth_a
+        .shard
+        .symbols
+        .iter()
+        .zip(&auth_b.shard.symbols)
+        .zip(&candidate.symbols)
+        .all(|((sa, sb), sc)| *sc == *sa + factor_b * *sb);
+    if !symbols_match {
         return Err(Error::PollutionDetected);
     }
 
@@ -218,5 +234,47 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err_proof, Error::CryptoFailure));
+    }
+
+    #[test]
+    fn rejects_fingerprint_collision_payload_tampering() {
+        let mut rng = ChaCha8Rng::seed_from_u64(4242);
+        let kzg = Kzg::setup(99, &mut rng);
+        let data = vec![63u8; 4096];
+        let shards = encode(&data, 30, 100, 33).unwrap();
+
+        let fps: Vec<Scalar> = shards.iter().map(|s| s.fingerprint()).collect();
+        let root = kzg.commit(&fps).unwrap();
+        let proof_a = kzg.open(&fps, 3).unwrap();
+        let proof_b = kzg.open(&fps, 11).unwrap();
+
+        let beta = Scalar::from(9u64);
+        let mut forged = repair_local_field(&shards[3], &shards[11], beta).unwrap();
+        let honest_fp = forged.fingerprint();
+
+        // 공개 평가점 r에 대해 sum(delta_j * r^{j+1}) == 0이 되도록 심볼을 변조해 지문 충돌 유도
+        let r = crate::verkle_kzg::evaluation_point(&forged.object_id);
+        forged.symbols[0] += r;
+        forged.symbols[1] -= Scalar::from(1u64);
+        assert_eq!(forged.fingerprint(), honest_fp);
+
+        let err = verify_homomorphic_repair(
+            &kzg,
+            &root,
+            AuthenticatedShard {
+                shard: &shards[3],
+                index: 3,
+                proof: &proof_a,
+            },
+            AuthenticatedShard {
+                shard: &shards[11],
+                index: 11,
+                proof: &proof_b,
+            },
+            beta,
+            &forged,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PollutionDetected));
     }
 }

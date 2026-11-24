@@ -409,7 +409,18 @@ pub async fn download_payload(
     while let Some(res) = set.join_next().await {
         if let Ok((slot, Ok(P2pResponse::ShardData { found: true, shard: Some(dto), .. }))) = res {
             if let Ok(sh) = dto.to_shard() {
-                collected_map.entry(slot).or_insert(sh);
+                let valid_obj = sh.validate().is_ok()
+                    && hex::encode(sh.object_id).eq_ignore_ascii_case(object_id_hex);
+                let valid_fp = match manifest.as_ref().and_then(|m| m.slot_fps_hex.get(slot as usize))
+                {
+                    Some(expected_fp) => {
+                        hex::encode(scalar_to_bytes(&sh.fingerprint())).eq_ignore_ascii_case(expected_fp)
+                    }
+                    None => true,
+                };
+                if valid_obj && valid_fp {
+                    collected_map.entry(slot).or_insert(sh);
+                }
             }
         }
     }
