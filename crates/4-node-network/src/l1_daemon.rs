@@ -633,6 +633,13 @@ async fn handle_rpc_conn(
                         .get(swarm_id)
                         .map(|r| r.iter().map(hex::encode).collect())
                         .unwrap_or_default();
+                    let object_ids_hex = guard
+                        .exec
+                        .db
+                        .swarm_objects
+                        .get(swarm_id)
+                        .map(|ids| ids.iter().map(hex::encode).collect())
+                        .unwrap_or_default();
                     let window = guard.exec.config.fault_challenge_window;
                     let recent_settlements = guard
                         .exec
@@ -649,6 +656,7 @@ async fn handle_rpc_conn(
                         swarm_id: *swarm_id,
                         state: st.clone(),
                         roster_pubkeys_hex: roster,
+                        object_ids_hex,
                         recent_settlements,
                     }
                 })

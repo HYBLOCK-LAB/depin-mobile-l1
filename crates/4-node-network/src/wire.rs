@@ -21,6 +21,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 pub const MAX_SYNC_BLOCKS: usize = 64;
 const IO_TIMEOUT: Duration = Duration::from_secs(60);
 const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(60);
+const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 pub fn decode_fixed_hex<const N: usize>(s: &str) -> Result<[u8; N]> {
     let raw = hex::decode(s).map_err(|e| Error::Network(format!("invalid hex: {e}")))?;
@@ -193,6 +194,12 @@ pub enum TxDto {
         swarm_id: u64,
         amount: u128,
     },
+    RegisterObject {
+        swarm_id: u64,
+        object_id_hex: String,
+        object_root_hex: String,
+        bounty: u128,
+    },
     SubmitSwarmCheckpoint {
         swarm_id: u64,
         epoch: u64,
@@ -242,6 +249,17 @@ impl TxDto {
                     amount: *amount,
                 }
             }
+            NativeTransaction::RegisterObject {
+                swarm_id,
+                object_id,
+                object_root,
+                bounty,
+            } => Self::RegisterObject {
+                swarm_id: *swarm_id,
+                object_id_hex: hex::encode(object_id),
+                object_root_hex: hex::encode(object_root),
+                bounty: *bounty,
+            },
             NativeTransaction::SubmitSwarmCheckpoint {
                 swarm_id,
                 epoch,
@@ -309,6 +327,17 @@ impl TxDto {
                     amount: *amount,
                 })
             }
+            Self::RegisterObject {
+                swarm_id,
+                object_id_hex,
+                object_root_hex,
+                bounty,
+            } => Ok(NativeTransaction::RegisterObject {
+                swarm_id: *swarm_id,
+                object_id: decode_fixed_hex::<32>(object_id_hex)?,
+                object_root: decode_fixed_hex::<48>(object_root_hex)?,
+                bounty: *bounty,
+            }),
             Self::SubmitSwarmCheckpoint {
                 swarm_id,
                 epoch,
@@ -563,6 +592,8 @@ pub struct SwarmSummaryDto {
     pub swarm_id: u64,
     pub state: VirtualSwarmState,
     pub roster_pubkeys_hex: Vec<String>,
+    #[serde(default)]
+    pub object_ids_hex: Vec<String>,
     #[serde(default)]
     pub recent_settlements: Vec<SettlementDto>,
 }
@@ -941,11 +972,19 @@ where
     Fut: Future<Output = Result<()>> + Send + 'static,
 {
     tokio::spawn(async move {
-        while let Ok((stream, _)) = listener.accept().await {
-            let st = Arc::clone(&state);
-            tokio::spawn(async move {
-                let _ = handler(stream, st).await;
-            });
+        loop {
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    let st = Arc::clone(&state);
+                    tokio::spawn(async move {
+                        let _ = handler(stream, st).await;
+                    });
+                }
+                Err(e) => {
+                    eprintln!("tcp accept failed on {:?}: {e}", listener.local_addr());
+                    tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
+                }
+            }
         }
     })
 }
@@ -976,6 +1015,12 @@ mod tests {
             NativeTransaction::DepositStorageBounty {
                 swarm_id: 3,
                 amount: 12_345,
+            },
+            NativeTransaction::RegisterObject {
+                swarm_id: 3,
+                object_id: [0x31; 32],
+                object_root: [0x32; 48],
+                bounty: 777,
             },
             NativeTransaction::SubmitSwarmCheckpoint {
                 swarm_id: 0,
